@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import ingest, candidates, whatsapp, users
+from app.routers import ingest, candidates, whatsapp, users, screening
 from app.services.scheduler import scheduler
 
 @asynccontextmanager
@@ -34,6 +34,9 @@ app.include_router(ingest.router)
 app.include_router(candidates.router)
 app.include_router(whatsapp.router)
 app.include_router(users.router)
+app.include_router(screening.router)
+# Webhook alias for /api/webhooks/sarvam
+app.add_api_route("/api/webhooks/sarvam", screening.sarvam_webhook, methods=["POST"], tags=["AI Screening"])
 
 @app.get("/")
 def home():

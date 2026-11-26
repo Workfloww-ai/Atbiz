@@ -12,6 +12,7 @@ token.json
 
 # Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 
@@ -22,3 +23,7 @@ out/
 
 # Mac
 .DS_Store
+ATBIZ_SARVAM_PHASE3_API_CONTRACT.md
+ATBIZ_SARVAM_INTEGRATION_DESIGN.md
+ATBIZ_SARVAM_PHASE3_MIGRATION_REVIEW.md
+atbiz-backend/tests/*

@@ -38,4 +38,13 @@ class Settings:
     RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "AT BiZ <notifications@atbiz.in>")
     FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
+    # Sarvam AI Configuration
+    SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
+    SARVAM_ORG_ID = os.getenv("SARVAM_ORG_ID", "01a12f81-9826-7a7e-b651-b385b5409531")
+    SARVAM_WORKSPACE_ID = os.getenv("SARVAM_WORKSPACE_ID", "01a12f81-982c-7e96-a0c4-2ab8a36aff22")
+    SARVAM_CAMPAIGN_ID = os.getenv("SARVAM_CAMPAIGN_ID", "test-atbiz-4ab9e19f-1d28")
+    SARVAM_WEBHOOK_SECRET = os.getenv("SARVAM_WEBHOOK_SECRET", "")
+    SARVAM_BASE_URL = os.getenv("SARVAM_BASE_URL", "https://apps.sarvam.ai")
+    MAX_SCREENING_ATTEMPTS = int(os.getenv("MAX_SCREENING_ATTEMPTS", "3"))
+
 settings = Settings()
