@@ -140,24 +140,21 @@ def list_candidates(
     if role:
         if site_id:
             # Candidate must have this role specifically at this site
+            # 1. Via multi-location entry
             m1 = supabase.table("candidates").select("id").eq("tenant_id", t_id).contains(
                 "extracted_attributes", {"locations_present": [{"site_id": site_id, "role_name": role}]}
             ).execute().data or []
-            role_cand_ids = set(c["id"] for c in m1)
-            # Fallback if locations_present not set
-            if not role_cand_ids:
-                m2 = supabase.table("candidates").select("id").eq("tenant_id", t_id).ilike("drive_folder_path", f"%/{role}/%").execute().data or []
-                role_cand_ids = set(c["id"] for c in m2)
+            # 2. Or via drive folder path
+            m2 = supabase.table("candidates").select("id").eq("tenant_id", t_id).ilike("drive_folder_path", f"%/{role}/%").execute().data or []
+            role_cand_ids = set(c["id"] for c in m1).union(c["id"] for c in m2)
             filtered_candidate_ids = role_cand_ids
         elif client_id:
             # Candidate must have this role at this client
             m1 = supabase.table("candidates").select("id").eq("tenant_id", t_id).contains(
                 "extracted_attributes", {"locations_present": [{"client_id": client_id, "role_name": role}]}
             ).execute().data or []
-            role_cand_ids = set(c["id"] for c in m1)
-            if not role_cand_ids:
-                m2 = supabase.table("candidates").select("id").eq("tenant_id", t_id).ilike("drive_folder_path", f"%/{role}/%").execute().data or []
-                role_cand_ids = set(c["id"] for c in m2)
+            m2 = supabase.table("candidates").select("id").eq("tenant_id", t_id).ilike("drive_folder_path", f"%/{role}/%").execute().data or []
+            role_cand_ids = set(c["id"] for c in m1).union(c["id"] for c in m2)
             filtered_candidate_ids = role_cand_ids
         else:
             # Global role filter
@@ -184,6 +181,32 @@ def list_candidates(
             filtered_candidate_ids = filtered_candidate_ids.intersection(app_cand_ids)
         else:
             filtered_candidate_ids = app_cand_ids
+
+    # When both role and site_id/client_id are filtered, ensure exact alignment with meta/tree role resolution
+    if role and (site_id or client_id) and filtered_candidate_ids:
+        c_rows = supabase.table("candidates").select("id, drive_folder_path, extracted_attributes").in_("id", list(filtered_candidate_ids)).execute().data or []
+        verified_ids = set()
+        for cand in c_rows:
+            attrs = cand.get("extracted_attributes") or {}
+            locs = attrs.get("locations_present") or []
+            cand_role = None
+            if site_id:
+                matched_loc = next((l for l in locs if l.get("site_id") == site_id), None)
+                if matched_loc and matched_loc.get("role_name"):
+                    cand_role = matched_loc["role_name"]
+            elif client_id:
+                matched_loc = next((l for l in locs if l.get("client_id") == client_id), None)
+                if matched_loc and matched_loc.get("role_name"):
+                    cand_role = matched_loc["role_name"]
+
+            if not cand_role:
+                parts = [p.strip() for p in (cand.get("drive_folder_path") or "").strip("/").split("/") if p.strip()]
+                cand_role = parts[2] if len(parts) >= 3 else "General"
+
+            if cand_role and cand_role.strip().lower() == role.strip().lower():
+                verified_ids.add(cand["id"])
+
+        filtered_candidate_ids = verified_ids
 
     if filtered_candidate_ids is not None:
         if not filtered_candidate_ids:
@@ -249,6 +272,11 @@ def list_candidates(
                     c["other_locations"] = locs
             else:
                 c["other_locations"] = locs
+
+            if not c.get("contextual_role"):
+                parts = [p.strip() for p in (c.get("drive_folder_path") or "").strip("/").split("/") if p.strip()]
+                if len(parts) >= 3:
+                    c["contextual_role"] = parts[2]
 
         if (sort_by or "").lower() == "status":
             candidate_list.sort(key=lambda x: (x.get("display_status") or "").lower(), reverse=desc)

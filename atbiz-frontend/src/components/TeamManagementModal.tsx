@@ -13,7 +13,10 @@ import {
   KeyRound,
   Layers,
   RefreshCw,
-  Briefcase
+  Briefcase,
+  Settings2,
+  Edit3,
+  ShieldCheck,
 } from "lucide-react";
 
 interface TeamMember {
@@ -39,6 +42,7 @@ interface TeamManagementModalProps {
   tenantName?: string;
   isDeveloper?: boolean;
   clients: { id: string; name: string }[];
+  onPermissionsUpdated?: () => void;
 }
 
 const AVAILABLE_MODULES = [
@@ -58,10 +62,86 @@ export default function TeamManagementModal({
   tenantName,
   isDeveloper,
   clients,
+  onPermissionsUpdated,
 }: TeamManagementModalProps) {
   const [activeTab, setActiveTab] = useState<"members" | "add">("members");
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [loadingMembers, setLoadingMembers] = useState(false);
+
+  // Edit Permissions State
+  const [editingMember, setEditingMember] = useState<TeamMember | null>(null);
+  const [editAccountTier, setEditAccountTier] = useState<string>("tenant_user");
+  const [editRoleName, setEditRoleName] = useState<string>("Team Member");
+  const [editSelectedClients, setEditSelectedClients] = useState<string[]>([]);
+  const [editSelectedModules, setEditSelectedModules] = useState<string[]>([]);
+  const [editSubmitting, setEditSubmitting] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [editSuccess, setEditSuccess] = useState<string | null>(null);
+
+  const handleStartEdit = (m: TeamMember) => {
+    setEditingMember(m);
+    setEditAccountTier(m.account_tier || "tenant_user");
+    setEditRoleName(m.role_name || "Team Member");
+    setEditSelectedClients((m.assigned_clients || []).map((c) => c.id));
+    setEditSelectedModules(m.assigned_modules || []);
+    setEditError(null);
+    setEditSuccess(null);
+  };
+
+  const toggleEditModule = (modId: string) => {
+    setEditSelectedModules((prev) =>
+      prev.includes(modId) ? prev.filter((id) => id !== modId) : [...prev, modId]
+    );
+  };
+
+  const toggleEditClient = (cid: string) => {
+    setEditSelectedClients((prev) =>
+      prev.includes(cid) ? prev.filter((id) => id !== cid) : [...prev, cid]
+    );
+  };
+
+  const handleSavePermissions = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingMember) return;
+    setEditSubmitting(true);
+    setEditError(null);
+    setEditSuccess(null);
+
+    try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+
+      const res = await fetch(`/api/users/${editingMember.id}/permissions`, {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({
+          account_tier: editAccountTier,
+          role_name: editRoleName.trim() || "Team Member",
+          client_ids: editSelectedClients,
+          modules: editSelectedModules,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setEditError(data.detail || "Failed to update permissions.");
+        setEditSubmitting(false);
+        return;
+      }
+
+      setEditSuccess("Permissions updated successfully!");
+      fetchMembers();
+      if (onPermissionsUpdated) onPermissionsUpdated();
+      setTimeout(() => {
+        setEditingMember(null);
+        setEditSuccess(null);
+      }, 1000);
+    } catch (err: any) {
+      setEditError(err.message || "An unexpected error occurred.");
+    } finally {
+      setEditSubmitting(false);
+    }
+  };
 
   // Available Tenants (For Developer tier)
   const [tenants, setTenants] = useState<{ id: string; name: string }[]>([]);
@@ -350,6 +430,7 @@ export default function TeamManagementModal({
                         <th className="px-3.5 py-2">Clients</th>
                         <th className="px-3.5 py-2">Modules</th>
                         <th className="px-3.5 py-2">Status</th>
+                        <th className="px-3.5 py-2 text-right">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
@@ -421,10 +502,184 @@ export default function TeamManagementModal({
                               </span>
                             )}
                           </td>
+                          <td className="px-3.5 py-2.5 text-right whitespace-nowrap">
+                            <button
+                              type="button"
+                              onClick={() => handleStartEdit(m)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded transition cursor-pointer"
+                              title="Edit user role, clients and module permissions"
+                            >
+                              <Edit3 className="w-3 h-3 text-slate-500" />
+                              <span>Edit Permissions</span>
+                            </button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
+                </div>
+              )}
+
+              {/* Edit Permissions Modal Overlay */}
+              {editingMember && (
+                <div className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-2xs">
+                  <div className="bg-white rounded-lg shadow-2xl border border-slate-200 w-full max-w-xl overflow-hidden flex flex-col max-h-[85vh]">
+                    <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between bg-slate-50">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                          <ShieldCheck className="w-4 h-4 text-slate-800" />
+                          <span>Edit Permissions: {editingMember.full_name}</span>
+                        </h3>
+                        <p className="text-[11px] text-slate-500">{editingMember.email}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setEditingMember(null)}
+                        className="p-1 text-slate-400 hover:text-slate-600 rounded transition cursor-pointer"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+
+                    <form onSubmit={handleSavePermissions} className="p-5 overflow-y-auto space-y-4 flex-1">
+                      {editError && (
+                        <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-700 rounded text-xs flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
+                          <span>{editError}</span>
+                        </div>
+                      )}
+                      {editSuccess && (
+                        <div className="p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded text-xs flex items-center gap-2">
+                          <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
+                          <span>{editSuccess}</span>
+                        </div>
+                      )}
+
+                      {/* Tier & Role */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs font-semibold text-slate-700 mb-1">Access Level (Role Tier)</label>
+                          <select
+                            value={editAccountTier}
+                            onChange={(e) => setEditAccountTier(e.target.value)}
+                            className="w-full text-xs border border-slate-300 rounded px-2.5 py-1.5 text-slate-900 bg-white focus:outline-none focus:border-slate-900"
+                          >
+                            <option value="tenant_user">Team Member (Scoped Access)</option>
+                            <option value="tenant_admin">Admin (HR Operations)</option>
+                            {isDeveloper && (
+                              <>
+                                <option value="tenant_super_admin">Tenant Super Admin</option>
+                                <option value="developer">Developer</option>
+                              </>
+                            )}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-slate-700 mb-1">Role Title / Designation</label>
+                          <input
+                            type="text"
+                            value={editRoleName}
+                            onChange={(e) => setEditRoleName(e.target.value)}
+                            className="w-full text-xs border border-slate-300 rounded px-2.5 py-1.5 text-slate-900 focus:outline-none focus:border-slate-900"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Modules Access */}
+                      <div>
+                        <label className="block text-xs font-bold text-slate-800 mb-1.5">
+                          Assigned Modules (Permissions)
+                        </label>
+                        <div className="grid grid-cols-2 gap-2">
+                          {AVAILABLE_MODULES.map((mod) => {
+                            const isChecked = editSelectedModules.includes(mod.id);
+                            return (
+                              <div
+                                key={mod.id}
+                                onClick={() => toggleEditModule(mod.id)}
+                                className={`p-2.5 border rounded cursor-pointer transition-all flex items-start gap-2 ${
+                                  isChecked
+                                    ? "border-slate-900 bg-slate-50 text-slate-900 shadow-2xs"
+                                    : "border-slate-200 bg-white hover:border-slate-300 text-slate-600"
+                                }`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={() => {}}
+                                  className="mt-0.5 rounded border-slate-300 text-slate-900 focus:ring-0 cursor-pointer"
+                                />
+                                <div>
+                                  <div className="font-semibold text-xs text-slate-900">{mod.name}</div>
+                                  <div className="text-[10px] text-slate-400">{mod.desc}</div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Clients Access */}
+                      {editAccountTier !== "developer" && (
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <label className="text-xs font-bold text-slate-800">Assigned Clients</label>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (editSelectedClients.length === clients.length) {
+                                  setEditSelectedClients([]);
+                                } else {
+                                  setEditSelectedClients(clients.map((c) => c.id));
+                                }
+                              }}
+                              className="text-[11px] font-semibold text-slate-600 hover:text-slate-900 cursor-pointer"
+                            >
+                              {editSelectedClients.length === clients.length ? "Deselect All" : "Select All"}
+                            </button>
+                          </div>
+                          <div className="grid grid-cols-2 gap-1.5 max-h-36 overflow-y-auto border border-slate-200 rounded p-2 bg-slate-50/50">
+                            {clients.map((c) => {
+                              const isSelected = editSelectedClients.includes(c.id);
+                              return (
+                                <label
+                                  key={c.id}
+                                  className={`flex items-center gap-2 px-2 py-1 rounded text-xs cursor-pointer ${
+                                    isSelected ? "bg-white font-medium text-slate-900 shadow-2xs border border-slate-200" : "text-slate-600 hover:bg-slate-100"
+                                  }`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={isSelected}
+                                    onChange={() => toggleEditClient(c.id)}
+                                    className="rounded border-slate-300 text-slate-900 focus:ring-0"
+                                  />
+                                  <span className="truncate">{c.name}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="pt-3 border-t border-slate-200 flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setEditingMember(null)}
+                          className="px-3 py-1.5 text-xs font-medium border border-slate-300 rounded text-slate-700 hover:bg-slate-50 transition cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={editSubmitting}
+                          className="px-4 py-1.5 text-xs font-semibold bg-slate-900 hover:bg-black text-white rounded transition cursor-pointer disabled:opacity-50"
+                        >
+                          {editSubmitting ? "Saving..." : "Save Permissions"}
+                        </button>
+                      </div>
+                    </form>
+                  </div>
                 </div>
               )}
             </div>

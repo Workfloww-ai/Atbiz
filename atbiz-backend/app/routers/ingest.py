@@ -76,14 +76,17 @@ def get_sync_status(tenant_id: Optional[str] = None):
 def trigger_sync(
     background_tasks: BackgroundTasks,
     root_folder_id: Optional[str] = None,
-    tenant_id: Optional[str] = None
+    tenant_id: Optional[str] = None,
+    force: bool = False
 ):
     """
     Manually trigger Google Drive resume sync in the background.
     Returns HTTP 409 Conflict if another sync is already active for this tenant.
+    Pass force=True to unlock/expire any stuck sync run.
     """
     t_id = tenant_id or settings.DEFAULT_TENANT_ID
-    run_id = scheduler._acquire_db_lock(triggered_by="manual")
+    stale_mins = 0 if force else 10
+    run_id = scheduler._acquire_db_lock(triggered_by="manual", stale_minutes=stale_mins)
     if not run_id:
         raise HTTPException(
             status_code=409,

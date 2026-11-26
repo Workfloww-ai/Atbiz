@@ -30,8 +30,8 @@ class Settings:
     WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
     DOVESOFT_API_KEY = os.getenv("DOVESOFT_API_KEY", "")
     DOVESOFT_WABA_NUMBER = os.getenv("DOVESOFT_WABA_NUMBER", os.getenv("WABA_NUMBER", ""))
-    DOVESOFT_DOWNLOAD_URL = os.getenv("DOVESOFT_DOWNLOAD_URL", "https://api.dovesoft.io//REST/directApi/downloadAttachmentFile")
-    DOVESOFT_SEND_URL = os.getenv("DOVESOFT_SEND_URL") or os.getenv("DOVESOFT_WHATSAPP_URL") or "https://api.dovesoft.io//REST/directApi/sendMessage"
+    DOVESOFT_DOWNLOAD_URL = os.getenv("DOVESOFT_DOWNLOAD_URL", "https://api.dovesoft.io/REST/directApi/downloadAttachmentFile")
+    DOVESOFT_SEND_URL = os.getenv("DOVESOFT_SEND_URL") or os.getenv("DOVESOFT_WHATSAPP_URL") or "https://api.dovesoft.io/REST/directApi/message"
 
     # Email / Resend Configuration
     RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")

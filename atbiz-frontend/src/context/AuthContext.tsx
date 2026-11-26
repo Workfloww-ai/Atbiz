@@ -29,7 +29,7 @@ interface AuthContextType {
   isAdmin: boolean;
   canAccessClient: (clientId: string) => boolean;
   canAccessModule: (moduleId: string) => boolean;
-  login: (email: string, password: string) => Promise<{ error?: string; mustChangePassword?: boolean }>;
+  login: (email: string, password: string) => Promise<{ error?: string; mustChangePassword?: boolean; profile?: UserProfile | null }>;
   logout: () => Promise<void>;
   changePassword: (newPassword: string) => Promise<{ error?: string }>;
   refreshProfile: () => Promise<void>;
@@ -157,7 +157,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setUser(data.user);
         const p = await fetchUserProfile(data.session.access_token, data.user.id, data.user.email || "");
         setProfile(p);
-        return { mustChangePassword: p?.must_change_password ?? false };
+        return { mustChangePassword: p?.must_change_password ?? false, profile: p };
       }
 
       return {};

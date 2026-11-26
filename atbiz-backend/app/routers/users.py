@@ -32,6 +32,14 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class UpdateUserPermissionsRequest(BaseModel):
+    account_tier: Optional[str] = None
+    role_name: Optional[str] = None
+    client_ids: Optional[List[str]] = None
+    site_ids: Optional[List[str]] = None
+    modules: Optional[List[str]] = None
+
+
 def generate_temp_password(length: int = 12) -> str:
     """Generates a secure, human-readable temporary password with symbols and digits."""
     upper = secrets.choice(string.ascii_uppercase)
@@ -378,3 +386,123 @@ def list_all_tenants(user: AuthUser = Depends(get_current_user)):
                 }
             ]
         }
+
+
+@router.patch("/{target_user_id}/permissions")
+def update_user_permissions(
+    target_user_id: str,
+    req: UpdateUserPermissionsRequest,
+    user: AuthUser = Depends(require_admin)
+):
+    """
+    Updates a user's permissions, role, assigned clients, and assigned modules.
+    Only Admins and Developers can update permissions.
+    """
+    supabase = get_supabase()
+
+    # 1. Fetch target user's current profile to verify tenant boundary
+    target_prof_res = supabase.table("profiles").select("*").eq("id", target_user_id).execute()
+    if not target_prof_res.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User with ID '{target_user_id}' not found."
+        )
+    target_prof = target_prof_res.data[0]
+    target_tenant_id = target_prof.get("tenant_id") or user.tenant_id or settings.DEFAULT_TENANT_ID
+
+    # Enforce tenant isolation: Tenant Admins cannot edit users outside their own tenant
+    if not user.is_developer and user.tenant_id and target_prof.get("tenant_id") != user.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot modify users from another tenant."
+        )
+
+    # Permission check: Tenant Admins cannot grant developer or super_admin tiers
+    if req.account_tier in ("developer", "tenant_super_admin") and not user.is_super_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Super Admins or Developers can grant privileged administrative tiers."
+        )
+
+    # 2. Update profiles table
+    profile_updates = {}
+    if req.account_tier:
+        profile_updates["account_tier"] = req.account_tier
+    if req.role_name is not None:
+        if req.role_name and target_tenant_id:
+            try:
+                r_res = supabase.table("roles").select("id").eq("tenant_id", target_tenant_id).eq("name", req.role_name).execute()
+                if r_res.data:
+                    profile_updates["primary_role_id"] = r_res.data[0]["id"]
+                else:
+                    ins = supabase.table("roles").insert({
+                        "tenant_id": target_tenant_id,
+                        "name": req.role_name,
+                        "description": f"Role for {req.role_name}"
+                    }).execute()
+                    if ins.data:
+                        profile_updates["primary_role_id"] = ins.data[0]["id"]
+            except Exception as e:
+                print(f"Role update warning: {e}")
+
+    if profile_updates:
+        supabase.table("profiles").update(profile_updates).eq("id", target_user_id).execute()
+
+    # 3. Update Module Assignments
+    if req.modules is not None:
+        try:
+            supabase.table("user_module_assignments").delete().eq("user_id", target_user_id).execute()
+        except Exception as e:
+            print(f"Warning deleting old module assignments: {e}")
+
+        if req.modules:
+            module_records = [
+                {
+                    "tenant_id": target_tenant_id,
+                    "user_id": target_user_id,
+                    "module_id": mid,
+                    "assigned_by": user.id
+                }
+                for mid in req.modules
+            ]
+            try:
+                supabase.table("user_module_assignments").upsert(
+                    module_records, on_conflict="tenant_id, user_id, module_id"
+                ).execute()
+            except Exception as e:
+                print(f"Warning inserting updated module assignments: {e}")
+
+    # 4. Update Client Assignments
+    if req.client_ids is not None:
+        try:
+            supabase.table("user_client_assignments").delete().eq("user_id", target_user_id).execute()
+        except Exception as e:
+            print(f"Warning deleting old client assignments: {e}")
+
+        if req.client_ids:
+            client_records = [
+                {
+                    "tenant_id": target_tenant_id,
+                    "user_id": target_user_id,
+                    "client_id": cid,
+                    "assigned_by": user.id,
+                    "status": "active"
+                }
+                for cid in req.client_ids
+            ]
+            try:
+                supabase.table("user_client_assignments").upsert(
+                    client_records, on_conflict="tenant_id, user_id, client_id"
+                ).execute()
+            except Exception as e:
+                print(f"Warning inserting updated client assignments: {e}")
+
+    return {
+        "status": "success",
+        "message": f"Permissions updated successfully for user {target_user_id}",
+        "user_id": target_user_id,
+        "modules": req.modules,
+        "client_ids": req.client_ids,
+        "account_tier": req.account_tier,
+        "role_name": req.role_name
+    }

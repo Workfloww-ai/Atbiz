@@ -38,8 +38,13 @@ class WhatsAppService:
                 "text": {"body": message}
             }
             try:
+                print(f"[WhatsApp] Sending reply to {clean_phone} via Dovesoft ({settings.DOVESOFT_SEND_URL})...")
                 resp = requests.post(settings.DOVESOFT_SEND_URL, headers=headers, json=payload, timeout=10)
-                return resp.json()
+                print(f"[WhatsApp] Send response: HTTP {resp.status_code} - {resp.text}")
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"status": resp.status_code, "text": resp.text}
             except Exception as e:
                 print(f"[Dovesoft] Error sending reply to {to_phone}: {e}")
                 return {"error": str(e)}
@@ -85,6 +90,7 @@ class WhatsAppService:
             "wabaNumber": self.dovesoft_waba,
         }
         params = {"mediaId": media_id}
+        print(f"[Dovesoft] Requesting media download from {url} (mediaId={media_id})...")
 
         for attempt in range(1, 4):
             try:
@@ -97,21 +103,42 @@ class WhatsAppService:
                     return None, f"Dovesoft download failed HTTP {resp.status_code}: {resp.text}"
 
                 data = resp.json()
-                raw_file = data.get("file")
+                if isinstance(data, dict):
+                    print(f"[Dovesoft] Download response received keys: {list(data.keys())}")
+                    raw_file = (
+                        data.get("file")
+                        or data.get("data")
+                        or data.get("fileContent")
+                        or data.get("base64")
+                        or data.get("attachment")
+                        or data.get("content")
+                    )
+                else:
+                    raw_file = data
+
                 if isinstance(raw_file, str):
-                    file_bytes = base64.b64decode(raw_file)
-                elif isinstance(raw_file, list):
-                    file_bytes = bytes(raw_file)
+                    try:
+                        file_bytes = base64.b64decode(raw_file)
+                    except Exception:
+                        file_bytes = raw_file.encode("latin-1")
+                elif isinstance(raw_file, (list, tuple)):
+                    # Handle signed byte array from Java backend (-128 to 127) -> convert to 0..255
+                    file_bytes = bytes([b & 0xFF for b in raw_file])
+                elif isinstance(raw_file, bytes):
+                    file_bytes = raw_file
                 else:
                     return None, f"Unexpected Dovesoft 'file' payload format: {type(raw_file)}"
 
                 # Determine MIME type from magic bytes
                 mime_type = "application/pdf"
-                if file_bytes.startswith(b"PK\x03\x04"):
+                if file_bytes.startswith(b"%PDF"):
+                    mime_type = "application/pdf"
+                elif file_bytes.startswith(b"PK\x03\x04"):
                     mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 elif file_bytes.startswith(b"\xd0\xcf\x11\xe0"):
                     mime_type = "application/msword"
 
+                print(f"✅ [Dovesoft] Successfully decoded file: {len(file_bytes)} bytes (MIME: {mime_type})")
                 return file_bytes, mime_type
             except Exception as e:
                 if attempt == 3:
@@ -120,10 +147,24 @@ class WhatsAppService:
 
         return None, "Dovesoft download retries exhausted"
 
-    def download_media_bytes(self, media_id: str) -> Tuple[Optional[bytes], Optional[str]]:
+    def download_media_bytes(self, media_id: str, direct_url: Optional[str] = None) -> Tuple[Optional[bytes], Optional[str]]:
         """
-        Download media bytes: uses Dovesoft if configured, otherwise Meta Cloud API.
+        Download media bytes:
+        - If direct URL is present or media_id is an HTTP URL, download directly.
+        - Otherwise uses Dovesoft if configured, else Meta Cloud API.
         """
+        target_url = direct_url if (direct_url and direct_url.startswith("http")) else (media_id if (media_id and media_id.startswith("http")) else None)
+        if target_url:
+            try:
+                print(f"[WhatsApp] Downloading media from direct URL: {target_url}")
+                res = requests.get(target_url, timeout=30)
+                if res.status_code == 200:
+                    mime_type = res.headers.get("Content-Type", "application/pdf")
+                    return res.content, mime_type
+                print(f"[WhatsApp] Direct download returned HTTP {res.status_code}")
+            except Exception as e:
+                print(f"[WhatsApp] Direct download error: {e}")
+
         if self.dovesoft_key and self.dovesoft_waba:
             return self.download_dovesoft_media(media_id)
 
@@ -167,12 +208,45 @@ class WhatsAppService:
         entries = event_data.get("entry") or []
         results = []
 
-        # Fallback: Support flat Dovesoft webhook payloads
-        if not entries and ("mediaId" in event_data or "from" in event_data or "mobileNo" in event_data or "media_id" in event_data):
-            sender = event_data.get("from") or event_data.get("mobileNo") or event_data.get("sender") or ""
-            media_id = event_data.get("mediaId") or event_data.get("media_id") or (event_data.get("document") or {}).get("id")
-            filename = event_data.get("filename") or (event_data.get("document") or {}).get("filename") or f"Resume_{sender}.pdf"
-            msg_type = event_data.get("type") or ("document" if media_id else "text")
+        # Case 1: Unwrapped Meta format where event_data directly contains "messages"
+        if not entries and "messages" in event_data:
+            entries = [{"changes": [{"value": event_data}]}]
+
+        # Case 2: Nested under "data"
+        if not entries and isinstance(event_data.get("data"), dict):
+            nested_data = event_data["data"]
+            if "messages" in nested_data:
+                entries = [{"changes": [{"value": nested_data}]}]
+            elif "entry" in nested_data:
+                entries = nested_data["entry"]
+            else:
+                event_data = {**event_data, **nested_data}
+
+        # Case 3: Flat Dovesoft webhook payloads
+        if not entries and any(k in event_data for k in ("mediaId", "from", "mobileNo", "media_id", "phone", "sender")):
+            sender = (
+                event_data.get("from")
+                or event_data.get("mobileNo")
+                or event_data.get("sender")
+                or event_data.get("phone")
+                or ""
+            )
+            media_id = (
+                event_data.get("mediaId")
+                or event_data.get("media_id")
+                or (event_data.get("document") or {}).get("id")
+                or event_data.get("id")
+            )
+            filename = (
+                event_data.get("filename")
+                or event_data.get("fileName")
+                or (event_data.get("document") or {}).get("filename")
+                or f"Resume_{sender}.pdf"
+            )
+            msg_type = (
+                event_data.get("type")
+                or ("document" if (media_id or event_data.get("caption") or "pdf" in str(filename).lower()) else "text")
+            )
             normalized_msg = {
                 "id": event_data.get("id") or f"dovesoft_{int(now)}_{sender}",
                 "from": str(sender),
@@ -213,12 +287,15 @@ class WhatsAppService:
                     if msg_type == "document":
                         doc = msg.get("document", {})
                         media_id = doc.get("id")
+                        doc_url = doc.get("url") or doc.get("link") or doc.get("attachmentUrl") or doc.get("fileUrl")
                         orig_filename = doc.get("filename") or f"Resume_{sender_wa_id}.pdf"
                         clean_filename = re.sub(r'[^\w\.\-]', '_', orig_filename)
                         safe_file_name = f"{sender_wa_id}_{clean_filename}"
 
-                        file_bytes, mime_or_err = self.download_media_bytes(media_id)
+                        print(f"[WhatsApp] Processing incoming document: {clean_filename} (media_id: {media_id}, url: {doc_url}) from {sender_wa_id}")
+                        file_bytes, mime_or_err = self.download_media_bytes(media_id, direct_url=doc_url)
                         if not file_bytes:
+                            print(f"❌ [WhatsApp] Media download failed: {mime_or_err}")
                             self.send_text_message(
                                 sender_wa_id,
                                 f"⚠️ Could not download {clean_filename}. Please try forwarding it again."
@@ -230,6 +307,7 @@ class WhatsAppService:
                         drive_file_id = None
                         try:
                             whatsapp_folder_id = self.gdrive.get_whatsapp_folder_id()
+                            print(f"[WhatsApp] Uploading to Google Drive folder '{whatsapp_folder_id}' as '{safe_file_name}'...")
                             drive_file = self.gdrive.upload_file(
                                 folder_id=whatsapp_folder_id,
                                 file_name=safe_file_name,
@@ -237,18 +315,17 @@ class WhatsAppService:
                                 mime_type=mime_or_err or "application/pdf"
                             )
                             drive_file_id = drive_file.get("id")
-                            print(f"[WhatsApp] Resume saved to Drive 'WhatsApp' folder: {safe_file_name} (ID: {drive_file_id})")
+                            print(f"✅ [WhatsApp] Resume successfully saved to Drive 'WhatsApp' folder: {safe_file_name} (ID: {drive_file_id})")
                         except Exception as drive_err:
-                            print(f"[WhatsApp] Failed to save to Drive: {drive_err}")
+                            print(f"❌ [WhatsApp] Failed to save to Drive: {drive_err}")
                             results.append({"status": "drive_upload_failed", "error": str(drive_err)})
                             continue
 
                         # Auto-reply confirmation to the team member who forwarded it
                         reply_text = (
-                            f"✅ Received & Saved to Google Drive!\n\n"
+                            f"✅ Uploaded successfully in your Drive!\n\n"
                             f"📄 File: {clean_filename}\n"
-                            f"📁 Folder: Google Drive > WhatsApp\n\n"
-                            f"Our HR team will segregate and process the candidate."
+                            f"📁 Folder: Google Drive > WhatsApp"
                         )
                         self.send_text_message(sender_wa_id, reply_text)
 

@@ -34,14 +34,14 @@ class SyncScheduler:
             "is_syncing": self.current_run_id is not None
         }
 
-    def _acquire_db_lock(self, triggered_by: str = "scheduler") -> Optional[str]:
+    def _acquire_db_lock(self, triggered_by: str = "scheduler", stale_minutes: int = 10) -> Optional[str]:
         """Attempt to acquire distributed sync lock via Postgres start_sync_run function."""
         supabase = get_supabase()
         try:
             res = supabase.rpc("start_sync_run", {
                 "p_tenant_id": settings.DEFAULT_TENANT_ID,
                 "p_triggered_by": triggered_by,
-                "p_stale_minutes": 10
+                "p_stale_minutes": stale_minutes
             }).execute()
             return res.data
         except Exception:

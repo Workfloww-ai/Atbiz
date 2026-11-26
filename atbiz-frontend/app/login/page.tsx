@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/src/context/AuthContext";
 import {
@@ -13,12 +14,13 @@ import {
   CheckCircle2,
   AlertCircle,
   ArrowRight,
+  ArrowLeft,
   ShieldCheck,
 } from "lucide-react";
 
 export default function LoginPage() {
   const router = useRouter();
-  const { user, profile, loading, login, changePassword } = useAuth();
+  const { user, profile, loading, login, logout, changePassword } = useAuth();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -33,13 +35,33 @@ export default function LoginPage() {
   const [showNewPassword, setShowNewPassword] = useState(false);
   const [resetSuccess, setResetSuccess] = useState(false);
 
-  // If already logged in and no password change needed, redirect to dashboard
+  // Module Access Restricted State
+  const [hasNoResumeDeskAccess, setHasNoResumeDeskAccess] = useState(false);
+
+  const checkUserHasResumeDesk = (p: any): boolean => {
+    if (!p) return false;
+    if (
+      p.account_tier === "developer" ||
+      p.account_tier === "tenant_super_admin" ||
+      p.account_tier === "tenant_admin"
+    ) {
+      return true;
+    }
+    const modules = p.assigned_modules || [];
+    return modules.includes("resume_desk");
+  };
+
+  // If already logged in and no password change needed, redirect or show restricted state
   useEffect(() => {
     if (!loading && user && profile) {
       if (profile.must_change_password) {
         setMustReset(true);
       } else {
-        router.push("/");
+        if (checkUserHasResumeDesk(profile)) {
+          router.push("/resume-desk");
+        } else {
+          setHasNoResumeDeskAccess(true);
+        }
       }
     }
   }, [loading, user, profile, router]);
@@ -47,6 +69,7 @@ export default function LoginPage() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
+    setHasNoResumeDeskAccess(false);
     setIsSubmitting(true);
 
     try {
@@ -60,7 +83,12 @@ export default function LoginPage() {
       if (res.mustChangePassword) {
         setMustReset(true);
       } else {
-        router.push("/");
+        const hasAccess = checkUserHasResumeDesk(res.profile);
+        if (hasAccess) {
+          router.push("/resume-desk");
+        } else {
+          setHasNoResumeDeskAccess(true);
+        }
       }
     } catch (err: any) {
       setErrorMessage(err.message || "Failed to sign in. Please try again.");
@@ -94,7 +122,12 @@ export default function LoginPage() {
 
       setResetSuccess(true);
       setTimeout(() => {
-        router.push("/");
+        if (checkUserHasResumeDesk(profile)) {
+          router.push("/resume-desk");
+        } else {
+          setMustReset(false);
+          setHasNoResumeDeskAccess(true);
+        }
       }, 1200);
     } catch (err: any) {
       setErrorMessage(err.message || "Failed to update password.");
@@ -106,6 +139,17 @@ export default function LoginPage() {
     <div className="min-h-screen bg-[#f8fafc] text-slate-800 flex flex-col justify-center items-center p-4 relative">
       {/* Top Header Brand Bar */}
       <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl shadow-xl shadow-slate-200/60 p-8 relative z-10">
+        {/* Back to Welcome Page Button */}
+        <div className="mb-4">
+          <Link
+            href="/"
+            className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-slate-900 transition-colors py-1.5 px-2.5 -ml-2 rounded-lg hover:bg-slate-100/80 cursor-pointer"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>Back to Welcome Page</span>
+          </Link>
+        </div>
+
         {/* Brand Header */}
         <div className="flex flex-col items-center mb-7 text-center">
           <div className="w-12 h-12 rounded-xl bg-slate-900 flex items-center justify-center text-white shadow-xs mb-3.5">
@@ -113,7 +157,7 @@ export default function LoginPage() {
           </div>
           <h1 className="text-2xl font-bold text-slate-900 tracking-tight">AT BiZ Platform</h1>
           <p className="text-xs text-slate-500 mt-1 font-medium">
-            Enterprise Workforce & Recruitment Management
+            Enterprise Workforce & Operational Management
           </p>
         </div>
 
@@ -125,8 +169,46 @@ export default function LoginPage() {
           </div>
         )}
 
-        {/* 1. First-Time Password Change Mode */}
-        {mustReset ? (
+        {/* Access Restricted Mode */}
+        {hasNoResumeDeskAccess ? (
+          <div className="space-y-4">
+            <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-950">
+              <div className="flex items-center gap-2 font-bold text-xs text-amber-950">
+                <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>Resume Desk Permission Required</span>
+              </div>
+              <p className="text-xs text-amber-900 mt-2 leading-relaxed">
+                Your account ({user?.email || profile?.email || email}) has been verified, but you have not been granted permission to access the <strong>Resume Desk</strong> module.
+              </p>
+              <p className="text-[11px] text-amber-800 mt-2">
+                Please contact your workspace administrator or HR Operations manager to assign you module permissions in <strong>Team Management</strong>.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => router.push("/")}
+                className="w-full bg-slate-900 hover:bg-black text-white font-semibold py-2.5 px-4 rounded-lg text-xs transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs"
+              >
+                <span>Back to Welcome Page</span>
+                <ArrowRight className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  await logout();
+                  setHasNoResumeDeskAccess(false);
+                  setEmail("");
+                  setPassword("");
+                }}
+                className="w-full bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-medium py-2 px-4 rounded-lg text-xs transition cursor-pointer"
+              >
+                Sign In with Different Account
+              </button>
+            </div>
+          </div>
+        ) : mustReset ? (
           <div>
             <div className="mb-5 p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-900">
               <div className="flex items-center gap-2 font-semibold text-xs text-amber-950">

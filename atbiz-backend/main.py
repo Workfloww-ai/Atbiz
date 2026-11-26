@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import ingest, candidates, whatsapp, users
 from app.services.scheduler import scheduler
@@ -43,6 +43,12 @@ def home():
         "version": "1.0.0",
         "docs_url": "/docs"
     }
+
+@app.post("/")
+async def root_post_fallback(request: Request, background_tasks: BackgroundTasks):
+    """Fallback handler in case external webhook callback is configured without path suffix"""
+    from app.routers.whatsapp import handle_whatsapp_message
+    return await handle_whatsapp_message(request, background_tasks)
 
 @app.get("/health")
 def health():
