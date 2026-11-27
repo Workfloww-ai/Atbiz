@@ -105,6 +105,8 @@ class SyncScheduler:
             "skipped_duplicates": 0,
             "renamed_in_drive": 0,
             "unchanged_files": 0,
+            "deleted_from_drive": 0,
+            "deleted_candidates": 0,
             "errors": []
         }
         sync_status = "completed"

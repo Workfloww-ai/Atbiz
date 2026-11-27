@@ -35,10 +35,10 @@ export default function LoginPage() {
   const [showNewPassword, setShowNewPassword] = useState(false);
   const [resetSuccess, setResetSuccess] = useState(false);
 
-  // Module Access Restricted State
-  const [hasNoResumeDeskAccess, setHasNoResumeDeskAccess] = useState(false);
+  // Module Access Restricted State (User has 0 assigned modules)
+  const [hasNoModuleAccess, setHasNoModuleAccess] = useState(false);
 
-  const checkUserHasResumeDesk = (p: any): boolean => {
+  const checkUserHasModuleAccess = (p: any): boolean => {
     if (!p) return false;
     if (
       p.account_tier === "developer" ||
@@ -48,7 +48,7 @@ export default function LoginPage() {
       return true;
     }
     const modules = p.assigned_modules || [];
-    return modules.includes("resume_desk");
+    return modules.length > 0;
   };
 
   // If already logged in and no password change needed, redirect or show restricted state
@@ -57,10 +57,10 @@ export default function LoginPage() {
       if (profile.must_change_password) {
         setMustReset(true);
       } else {
-        if (checkUserHasResumeDesk(profile)) {
+        if (checkUserHasModuleAccess(profile)) {
           router.push("/resume-desk");
         } else {
-          setHasNoResumeDeskAccess(true);
+          setHasNoModuleAccess(true);
         }
       }
     }
@@ -69,7 +69,7 @@ export default function LoginPage() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
-    setHasNoResumeDeskAccess(false);
+    setHasNoModuleAccess(false);
     setIsSubmitting(true);
 
     try {
@@ -83,11 +83,11 @@ export default function LoginPage() {
       if (res.mustChangePassword) {
         setMustReset(true);
       } else {
-        const hasAccess = checkUserHasResumeDesk(res.profile);
+        const hasAccess = checkUserHasModuleAccess(res.profile);
         if (hasAccess) {
           router.push("/resume-desk");
         } else {
-          setHasNoResumeDeskAccess(true);
+          setHasNoModuleAccess(true);
         }
       }
     } catch (err: any) {
@@ -122,11 +122,11 @@ export default function LoginPage() {
 
       setResetSuccess(true);
       setTimeout(() => {
-        if (checkUserHasResumeDesk(profile)) {
+        if (checkUserHasModuleAccess(profile)) {
           router.push("/resume-desk");
         } else {
           setMustReset(false);
-          setHasNoResumeDeskAccess(true);
+          setHasNoModuleAccess(true);
         }
       }, 1200);
     } catch (err: any) {
@@ -169,16 +169,16 @@ export default function LoginPage() {
           </div>
         )}
 
-        {/* Access Restricted Mode */}
-        {hasNoResumeDeskAccess ? (
+        {/* Access Restricted Mode (No modules assigned) */}
+        {hasNoModuleAccess ? (
           <div className="space-y-4">
             <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-950">
               <div className="flex items-center gap-2 font-bold text-xs text-amber-950">
                 <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
-                <span>Resume Desk Permission Required</span>
+                <span>Workspace Permission Required</span>
               </div>
               <p className="text-xs text-amber-900 mt-2 leading-relaxed">
-                Your account ({user?.email || profile?.email || email}) has been verified, but you have not been granted permission to access the <strong>Resume Desk</strong> module.
+                Your account ({user?.email || profile?.email || email}) has been verified, but your organization administrator has not assigned any workspace modules (e.g. Hiring Pipeline, Resume Desk, Attendance) to your account yet.
               </p>
               <p className="text-[11px] text-amber-800 mt-2">
                 Please contact your workspace administrator or HR Operations manager to assign you module permissions in <strong>Team Management</strong>.
@@ -198,7 +198,7 @@ export default function LoginPage() {
                 type="button"
                 onClick={async () => {
                   await logout();
-                  setHasNoResumeDeskAccess(false);
+                  setHasNoModuleAccess(false);
                   setEmail("");
                   setPassword("");
                 }}

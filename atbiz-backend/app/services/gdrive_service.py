@@ -11,7 +11,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
-from app.config import settings
+from app.config import settings, BASE_DIR
 
 # Full Drive scope to allow both reading resumes and auto-creating folders
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -84,9 +84,17 @@ class GoogleDriveService:
                 token.write(creds.to_json())
 
         # 3. Service Account
-        if not creds and os.path.exists(self.service_account_path):
+        candidate_sa_paths = [
+            self.service_account_path,
+            os.path.join(BASE_DIR, "service_account.json"),
+            os.path.join(os.path.dirname(BASE_DIR), "service_account.json"),
+            os.path.abspath("service_account.json"),
+            os.path.abspath("atbiz-backend/service_account.json"),
+        ]
+        sa_path = next((p for p in candidate_sa_paths if p and os.path.exists(p)), None)
+        if not creds and sa_path:
             creds = service_account.Credentials.from_service_account_file(
-                self.service_account_path,
+                sa_path,
                 scopes=SCOPES
             )
 
@@ -214,15 +222,22 @@ class GoogleDriveService:
 
         return self.execute_with_retry(req)
 
-    def download_file_bytes(self, file_id: str, max_size_mb: Optional[int] = None) -> bytes:
+    def download_file_bytes(self, file_id: str, max_size_mb: Optional[int] = None, mime_type: Optional[str] = None) -> bytes:
         """
         Download a file's binary content using temporary file streaming.
+        Supports standard files via get_media and Google Docs via export_media.
         Enforces maximum file size chunk-by-chunk to prevent memory exhaustion.
         Guarantees temp file cleanup in a finally block.
         """
         limit_bytes = (max_size_mb or settings.MAX_RESUME_SIZE_MB) * 1024 * 1024
         service = self._get_service()
-        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        if mime_type == 'application/vnd.google-apps.document':
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            )
+        else:
+            request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
 
         temp_file = tempfile.NamedTemporaryFile(delete=False)
         temp_path = temp_file.name
@@ -258,10 +273,18 @@ class GoogleDriveService:
         """
         Traverses nested folders (3 levels deep):
         [Root: Atbiz] -> [1. Client] -> [2. Site / State] -> [3. Role] -> [Resumes]
+        Also records active file IDs, folder paths, and hierarchy metadata for deletion sync.
         """
         folder_id = root_folder_id or settings.GOOGLE_DRIVE_ROOT_FOLDER_ID
         if not folder_id:
             raise ValueError("GOOGLE_DRIVE_ROOT_FOLDER_ID is not configured in .env")
+
+        self.last_crawl_metadata = {
+            "active_file_ids": set(),
+            "active_folder_paths": set(),
+            "hierarchy": {},
+            "completed": False
+        }
 
         folder_mime = 'application/vnd.google-apps.folder'
         max_bytes = settings.MAX_RESUME_SIZE_MB * 1024 * 1024
@@ -275,31 +298,47 @@ class GoogleDriveService:
             if client_name.strip().lower() in ("whatsapp", "whatsapp submissions", "trash", "archive"):
                 continue
 
+            self.last_crawl_metadata["active_folder_paths"].add(f"/{client_name}")
+            self.last_crawl_metadata["hierarchy"].setdefault(client_name, {})
+
             # Level 2: Site / State Folders (e.g. Delhi, Punjab, UPE)
             site_folders = self.list_children(client['id'], mime_type=folder_mime)
             for site in site_folders:
                 site_name = site['name']
+                self.last_crawl_metadata["active_folder_paths"].add(f"/{client_name}/{site_name}")
+                self.last_crawl_metadata["hierarchy"][client_name].setdefault(site_name, [])
 
                 # Level 3: Role / Designation Folders (e.g. Lobby Assistant, Technician)
                 role_folders = self.list_children(site['id'], mime_type=folder_mime)
                 for role in role_folders:
                     role_name = role['name']
+                    self.last_crawl_metadata["active_folder_paths"].add(f"/{client_name}/{site_name}/{role_name}")
+                    if role_name not in self.last_crawl_metadata["hierarchy"][client_name][site_name]:
+                        self.last_crawl_metadata["hierarchy"][client_name][site_name].append(role_name)
 
-                    # Files: Resumes (.pdf, .docx, .doc)
+                    # Files: Resumes (.pdf, .docx, .doc, and Google Docs)
                     files = self.list_children(role['id'])
                     for f in files:
                         fname = f['name'].lower()
-                        if fname.endswith(('.pdf', '.docx', '.doc')):
+                        mime = f.get('mimeType', '')
+                        is_gdoc = (mime == 'application/vnd.google-apps.document')
+                        if fname.endswith(('.pdf', '.docx', '.doc')) or is_gdoc:
+                            self.last_crawl_metadata["active_file_ids"].add(f['id'])
+                            # Normalized file name with extension
+                            f_display_name = f['name']
+                            if is_gdoc and not f_display_name.lower().endswith(('.docx', '.doc', '.pdf')):
+                                f_display_name = f"{f_display_name}.docx"
+
                             # Check metadata size if available
                             reported_size = int(f.get('size', 0)) if f.get('size') else 0
-                            if reported_size > max_bytes:
+                            if reported_size > max_bytes and not is_gdoc:
                                 yield {
                                     "file_id": f['id'],
-                                    "file_name": f['name'],
+                                    "file_name": f_display_name,
                                     "client_name": client_name,
                                     "site_name": site_name,
                                     "role_name": role_name,
-                                    "folder_path": f"/{client_name}/{site_name}/{role_name}/{f['name']}",
+                                    "folder_path": f"/{client_name}/{site_name}/{role_name}/{f_display_name}",
                                     "error": f"File exceeds {settings.MAX_RESUME_SIZE_MB}MB limit (Reported: {reported_size // (1024*1024)}MB)",
                                     "web_link": f.get('webViewLink'),
                                     "file_bytes": None
@@ -307,14 +346,14 @@ class GoogleDriveService:
                                 continue
 
                             try:
-                                file_bytes = self.download_file_bytes(f['id'])
+                                file_bytes = self.download_file_bytes(f['id'], mime_type=mime)
                                 yield {
                                     "file_id": f['id'],
-                                    "file_name": f['name'],
+                                    "file_name": f_display_name,
                                     "client_name": client_name,
                                     "site_name": site_name,
                                     "role_name": role_name,
-                                    "folder_path": f"/{client_name}/{site_name}/{role_name}/{f['name']}",
+                                    "folder_path": f"/{client_name}/{site_name}/{role_name}/{f_display_name}",
                                     "file_bytes": file_bytes,
                                     "web_link": f.get('webViewLink'),
                                     "file_size_bytes": len(file_bytes)
@@ -322,36 +361,55 @@ class GoogleDriveService:
                             except Exception as dl_err:
                                 yield {
                                     "file_id": f['id'],
-                                    "file_name": f['name'],
+                                    "file_name": f_display_name,
                                     "client_name": client_name,
                                     "site_name": site_name,
                                     "role_name": role_name,
-                                    "folder_path": f"/{client_name}/{site_name}/{role_name}/{f['name']}",
-                                    "error": str(dl_err),
+                                    "folder_path": f"/{client_name}/{site_name}/{role_name}/{f_display_name}",
+                                    "error": f"Download failed: {str(dl_err)}",
                                     "web_link": f.get('webViewLink'),
                                     "file_bytes": None
                                 }
 
-    @staticmethod
-    def crawl_local_directory(root_path: str) -> Generator[Dict[str, Any], None, None]:
-        """Fallback local scanner."""
+        self.last_crawl_metadata["completed"] = True
+
+    @classmethod
+    def crawl_local_directory(cls, root_path: str) -> Generator[Dict[str, Any], None, None]:
+        """Fallback local scanner with metadata tracking for testing."""
         if not os.path.exists(root_path):
             raise FileNotFoundError(f"Local test directory '{root_path}' does not exist.")
+
+        cls.last_crawl_metadata = {
+            "active_file_ids": set(),
+            "active_folder_paths": set(),
+            "hierarchy": {},
+            "completed": False
+        }
 
         for client_name in os.listdir(root_path):
             client_path = os.path.join(root_path, client_name)
             if not os.path.isdir(client_path) or client_name.startswith('.'):
                 continue
 
+            cls.last_crawl_metadata["active_folder_paths"].add(f"/{client_name}")
+            cls.last_crawl_metadata["hierarchy"].setdefault(client_name, {})
+
             for site_name in os.listdir(client_path):
                 site_path = os.path.join(client_path, site_name)
                 if not os.path.isdir(site_path) or site_name.startswith('.'):
                     continue
 
+                cls.last_crawl_metadata["active_folder_paths"].add(f"/{client_name}/{site_name}")
+                cls.last_crawl_metadata["hierarchy"][client_name].setdefault(site_name, [])
+
                 for role_name in os.listdir(site_path):
                     role_path = os.path.join(site_path, role_name)
                     if not os.path.isdir(role_path) or role_name.startswith('.'):
                         continue
+
+                    cls.last_crawl_metadata["active_folder_paths"].add(f"/{client_name}/{site_name}/{role_name}")
+                    if role_name not in cls.last_crawl_metadata["hierarchy"][client_name][site_name]:
+                        cls.last_crawl_metadata["hierarchy"][client_name][site_name].append(role_name)
 
                     for file_name in os.listdir(role_path):
                         if file_name.lower().endswith(('.pdf', '.docx', '.doc')):
@@ -359,8 +417,11 @@ class GoogleDriveService:
                             with open(full_file_path, 'rb') as f:
                                 file_bytes = f.read()
 
+                            f_id = f"local_{client_name}_{site_name}_{file_name}"
+                            cls.last_crawl_metadata["active_file_ids"].add(f_id)
+
                             yield {
-                                "file_id": f"local_{client_name}_{site_name}_{file_name}",
+                                "file_id": f_id,
                                 "file_name": file_name,
                                 "client_name": client_name,
                                 "site_name": site_name,
@@ -369,3 +430,5 @@ class GoogleDriveService:
                                 "file_bytes": file_bytes,
                                 "web_link": None
                             }
+
+        cls.last_crawl_metadata["completed"] = True

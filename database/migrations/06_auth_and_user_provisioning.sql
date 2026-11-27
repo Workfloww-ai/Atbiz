@@ -51,4 +51,11 @@ FOR ALL USING (
     OR (tenant_id = public.get_current_tenant_id() AND public.is_tenant_admin())
 );
 
+-- Ensure module IDs for resume_desk and pipeline are present
+INSERT INTO public.modules (id, name, description, sort_order)
+VALUES 
+  ('resume_desk', 'Resume Desk', 'Resume intake, search & digital filters', 6),
+  ('pipeline', 'Recruitment Pipeline', 'Application stages, interviews, and status', 7)
+ON CONFLICT (id) DO NOTHING;
+
 COMMIT;

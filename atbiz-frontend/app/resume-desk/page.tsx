@@ -125,7 +125,6 @@ const API_BASE = "";
 
 const STATUS_OPTIONS = [
   { label: "New", color: "bg-slate-500", text: "text-slate-700" },
-  { label: "Ready for AI Call", color: "bg-blue-500", text: "text-blue-700" },
   { label: "AI Call Initiated", color: "bg-amber-500", text: "text-amber-700" },
   { label: "Offer Sent", color: "bg-teal-500", text: "text-teal-700" },
   { label: "Accepted", color: "bg-indigo-600", text: "text-indigo-700" },
@@ -257,7 +256,15 @@ export default function ResumeDeskDashboard() {
   const [selectedCandidates, setSelectedCandidates] = useState<Record<string, boolean>>({});
 
   // Data state
-  const [clientTree, setClientTree] = useState<ClientItem[]>([]);
+  const [clientTree, setClientTree] = useState<ClientItem[]>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = sessionStorage.getItem("atbiz_cached_tree");
+        if (cached) return JSON.parse(cached);
+      } catch {}
+    }
+    return [];
+  });
 
   // Filter client tree based on user permissions
   const filteredClientTree = useMemo(() => {
@@ -269,9 +276,36 @@ export default function ResumeDeskDashboard() {
   const allClientsList = useMemo(() => {
     return clientTree.map((c) => ({ id: c.id, name: c.name }));
   }, [clientTree]);
-  const [totalCount, setTotalCount] = useState(0);
-  const [candidates, setCandidates] = useState<Candidate[]>([]);
-  const [candidatesCount, setCandidatesCount] = useState(0);
+
+  const [totalCount, setTotalCount] = useState<number>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = sessionStorage.getItem("atbiz_cached_total_count");
+        if (cached) return Number(cached);
+      } catch {}
+    }
+    return 0;
+  });
+
+  const [candidates, setCandidates] = useState<Candidate[]>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = sessionStorage.getItem("atbiz_cached_candidates");
+        if (cached) return JSON.parse(cached);
+      } catch {}
+    }
+    return [];
+  });
+
+  const [candidatesCount, setCandidatesCount] = useState<number>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = sessionStorage.getItem("atbiz_cached_candidates_count");
+        if (cached) return Number(cached);
+      } catch {}
+    }
+    return 0;
+  });
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -301,8 +335,47 @@ export default function ResumeDeskDashboard() {
       ]);
       if (treeRes.ok) {
         const treeData = await treeRes.json();
-        setClientTree(treeData.tree || []);
-        setTotalCount(treeData.total_count || 0);
+        const tree = treeData.tree || [];
+        const count = treeData.total_count || 0;
+        setClientTree(tree);
+        setTotalCount(count);
+        try {
+          sessionStorage.setItem("atbiz_cached_tree", JSON.stringify(tree));
+          sessionStorage.setItem("atbiz_cached_total_count", String(count));
+        } catch {}
+
+        // Auto-clean any selected folder that was deleted in Drive
+        setSelectedClientId((prevClient) => {
+          if (prevClient && !(treeData.tree || []).some((c: ClientItem) => c.id === prevClient)) {
+            setSelectedSiteId(null);
+            setSelectedRole(null);
+            return null;
+          }
+          return prevClient;
+        });
+        setSelectedSiteId((prevSite) => {
+          if (!prevSite) return null;
+          const currentClient = (treeData.tree || []).find((c: ClientItem) =>
+            c.sites?.some((s: SiteItem) => s.id === prevSite)
+          );
+          if (!currentClient) {
+            setSelectedRole(null);
+            return null;
+          }
+          return prevSite;
+        });
+        setSelectedRole((prevRole) => {
+          if (!prevRole) return null;
+          let roleStillExists = false;
+          (treeData.tree || []).forEach((c: ClientItem) => {
+            (c.sites || []).forEach((s: SiteItem) => {
+              if (s.roles?.some((r: RoleItem) => r.name === prevRole)) {
+                roleStillExists = true;
+              }
+            });
+          });
+          return roleStillExists ? prevRole : null;
+        });
 
         // Auto-expand all clients and sites initially
         const expClients: Record<string, boolean> = {};
@@ -325,9 +398,12 @@ export default function ResumeDeskDashboard() {
     }
   };
 
-  // 2. Fetch Candidates with active filters
+  // 2. Fetch Candidates with active filters (Silent background revalidation if data already present)
   const fetchCandidates = async () => {
-    setLoading(true);
+    // Only show full loading spinner/skeleton if candidates are not yet rendered
+    if (candidates.length === 0) {
+      setLoading(true);
+    }
     try {
       const isPipeline = activeTab === "Pipeline";
       const params = new URLSearchParams({
@@ -345,8 +421,18 @@ export default function ResumeDeskDashboard() {
       const res = await fetch(`${API_BASE}/api/candidates?${params.toString()}`);
       if (res.ok) {
         const data = await res.json();
-        setCandidates(data.data || []);
-        setCandidatesCount(data.count || 0);
+        const candList = data.data || [];
+        const candCount = data.count || 0;
+        setCandidates(candList);
+        setCandidatesCount(candCount);
+
+        // Cache initial view in sessionStorage for instant loads
+        try {
+          if (!selectedClientId && !selectedSiteId && !selectedRole && statusFilter === "All" && !searchQuery.trim() && page === 1 && !isPipeline) {
+            sessionStorage.setItem("atbiz_cached_candidates", JSON.stringify(candList));
+            sessionStorage.setItem("atbiz_cached_candidates_count", String(candCount));
+          }
+        } catch {}
       }
     } catch (err) {
       console.error("Error fetching candidates:", err);
@@ -510,45 +596,46 @@ export default function ResumeDeskDashboard() {
   const handleTriggerSync = async (force: boolean = false) => {
     setSyncing(true);
     setSyncNotice(null);
+
+    const pollUntilDone = (initialNotice: string) => {
+      setSyncNotice(initialNotice);
+      let checks = 0;
+      const interval = setInterval(async () => {
+        checks++;
+        try {
+          const statusRes = await fetch(`${API_BASE}/api/ingest/status`);
+          if (statusRes.ok) {
+            const data = await statusRes.json();
+            setSyncStatus(data);
+            if (!data.is_syncing || checks >= 30) {
+              clearInterval(interval);
+              setSyncing(false);
+              setSyncNotice(null);
+              await fetchMetaAndStatus();
+              await fetchCandidates();
+            }
+          }
+        } catch {
+          if (checks >= 30) {
+            clearInterval(interval);
+            setSyncing(false);
+            setSyncNotice(null);
+            await fetchMetaAndStatus();
+            await fetchCandidates();
+          }
+        }
+      }, 2000);
+    };
+
     try {
       const url = force ? `${API_BASE}/api/ingest/sync?force=true` : `${API_BASE}/api/ingest/sync`;
       const res = await fetch(url, { method: "POST" });
       if (res.status === 409) {
-        setSyncNotice("Sync already active in background. Processing Google Drive resumes now...");
-        // Poll for completion
-        let checks = 0;
-        const interval = setInterval(async () => {
-          checks++;
-          try {
-            const statusRes = await fetch(`${API_BASE}/api/ingest/status`);
-            if (statusRes.ok) {
-              const data = await statusRes.json();
-              setSyncStatus(data);
-              if (!data.is_syncing || checks >= 8) {
-                clearInterval(interval);
-                setSyncing(false);
-                setSyncNotice(null);
-                fetchCandidates();
-              }
-            }
-          } catch {
-            if (checks >= 8) {
-              clearInterval(interval);
-              setSyncing(false);
-              setSyncNotice(null);
-            }
-          }
-        }, 3000);
+        pollUntilDone("Sync already active in background. Syncing Google Drive resumes and folder structure...");
         return;
       }
       if (res.ok) {
-        setSyncNotice("Sync started! Scanning Drive folders for new resumes...");
-        setTimeout(async () => {
-          await fetchMetaAndStatus();
-          await fetchCandidates();
-          setSyncing(false);
-          setSyncNotice(null);
-        }, 4000);
+        pollUntilDone("Sync started! Scanning Drive folders for changes and removing deleted files...");
       } else {
         const err = await res.json().catch(() => ({}));
         setSyncNotice(err.detail || "Sync could not be started.");
@@ -562,13 +649,13 @@ export default function ResumeDeskDashboard() {
   };
 
   useEffect(() => {
-    if (!authLoading && user && (isAdmin || canAccessModule("resume_desk"))) {
+    if (!authLoading && user && (isAdmin || canAccessModule("resume_desk") || canAccessModule("pipeline"))) {
       fetchMetaAndStatus();
     }
   }, [authLoading, user, isAdmin]);
 
   useEffect(() => {
-    if (!authLoading && user && (isAdmin || canAccessModule("resume_desk"))) {
+    if (!authLoading && user && (isAdmin || canAccessModule("resume_desk") || canAccessModule("pipeline"))) {
       fetchCandidates();
     }
   }, [authLoading, user, isAdmin, selectedClientId, selectedSiteId, selectedRole, statusFilter, searchQuery, page, limit, sortBy, sortOrder, activeTab]);
@@ -760,8 +847,26 @@ export default function ResumeDeskDashboard() {
     return "All companies";
   }, [selectedClientId, selectedSiteId, clientTree]);
 
-  // 1. Loading screen while authenticating
-  if (authLoading) {
+  // Module permission check
+  const hasResumeDeskAccess = isAdmin || canAccessModule("resume_desk");
+  const hasPipelineAccess = isAdmin || canAccessModule("pipeline");
+  const hasAnyModuleAccess =
+    isAdmin ||
+    hasResumeDeskAccess ||
+    hasPipelineAccess ||
+    ((profile?.assigned_modules?.length ?? 0) > 0);
+
+  // Auto-switch to assigned module (e.g. Pipeline) if user has no Resume Desk access
+  useEffect(() => {
+    if (!authLoading && user) {
+      if (!hasResumeDeskAccess && hasPipelineAccess && activeTab === "Resume Desk") {
+        setActiveTab("Pipeline");
+      }
+    }
+  }, [authLoading, user, hasResumeDeskAccess, hasPipelineAccess, activeTab]);
+
+  // 1. Loading screen while authenticating (only shown if there is no cached profile)
+  if (authLoading && !profile) {
     return (
       <div className="flex h-screen w-full items-center justify-center bg-[#f8fafc]">
         <div className="flex flex-col items-center gap-3 text-center">
@@ -784,21 +889,19 @@ export default function ResumeDeskDashboard() {
     );
   }
 
-  // 3. Module permission check (Must have resume_desk or be admin/dev)
-  const hasResumeDeskAccess = isAdmin || canAccessModule("resume_desk");
-  if (!hasResumeDeskAccess) {
+  if (!hasAnyModuleAccess) {
     return (
       <div className="flex h-screen w-full items-center justify-center bg-[#f8fafc] p-4">
         <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl p-8 text-center shadow-xl">
           <div className="w-12 h-12 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-center mx-auto mb-4 text-amber-600">
             <ShieldCheck className="w-6 h-6" />
           </div>
-          <h2 className="text-base font-bold text-slate-900">Access Restricted</h2>
+          <h2 className="text-base font-bold text-slate-900">Workspace Access Required</h2>
           <p className="text-xs text-slate-600 mt-2 leading-relaxed">
-            You are signed in as <strong>{user.email}</strong>, but your account does not have permission to access the <strong>Resume Desk</strong> module.
+            You are signed in as <strong>{user?.email}</strong>, but your organization administrator has not assigned any workspace modules (e.g. Hiring Pipeline, Resume Desk, Attendance) to your account yet.
           </p>
           <p className="text-[11px] text-slate-400 mt-2">
-            Please ask your workspace administrator or HR Operations manager to assign you the Resume Desk module in Team & Permissions.
+            Please ask your workspace administrator or HR Operations manager to assign you module permissions in <strong>Team Management</strong>.
           </p>
           <div className="mt-6 flex flex-col gap-2">
             <button
@@ -855,15 +958,15 @@ export default function ResumeDeskDashboard() {
               setPage(1);
             }}
             className={`w-full flex items-center justify-between px-3 py-2 rounded-md cursor-pointer transition-colors ${selectedClientId === null && selectedSiteId === null
-                ? "bg-[#fce7e7] text-[#991b1b] font-semibold"
-                : "text-slate-700 hover:bg-slate-50 font-normal"
+              ? "bg-[#fce7e7] text-[#991b1b] font-semibold"
+              : "text-slate-700 hover:bg-slate-50 font-normal"
               }`}
           >
             <span>All companies</span>
             <span
               className={`text-xs ${selectedClientId === null && selectedSiteId === null
-                  ? "text-[#991b1b] font-semibold"
-                  : "text-slate-400 font-normal"
+                ? "text-[#991b1b] font-semibold"
+                : "text-slate-400 font-normal"
                 }`}
             >
               {totalCount}
@@ -946,8 +1049,8 @@ export default function ResumeDeskDashboard() {
                               setPage(1);
                             }}
                             className={`flex items-center justify-between px-2 py-1 rounded cursor-pointer text-xs transition-colors ${isSiteSelected && !selectedRole
-                                ? "bg-[#fce7e7] text-[#991b1b] font-medium"
-                                : "text-slate-600 hover:bg-slate-100"
+                              ? "bg-[#fce7e7] text-[#991b1b] font-medium"
+                              : "text-slate-600 hover:bg-slate-100"
                               }`}
                           >
                             <div className="flex items-center gap-2 truncate">
@@ -982,8 +1085,8 @@ export default function ResumeDeskDashboard() {
                                       setPage(1);
                                     }}
                                     className={`flex items-center justify-between px-2 py-0.5 rounded cursor-pointer text-[11px] transition-colors ${isRoleSelected
-                                        ? "bg-[#fee2e2] text-[#991b1b] font-semibold"
-                                        : "text-slate-500 hover:bg-slate-100"
+                                      ? "bg-[#fee2e2] text-[#991b1b] font-semibold"
+                                      : "text-slate-500 hover:bg-slate-100"
                                       }`}
                                   >
                                     <div className="flex items-center gap-1.5 truncate">
@@ -1145,10 +1248,10 @@ export default function ResumeDeskDashboard() {
                               setModuleDropdownOpen(false);
                             }}
                             className={`w-full text-left px-3 py-2 flex items-center justify-between transition-colors ${isSelected
-                                ? "bg-slate-100 text-slate-900 font-semibold"
-                                : canClick
-                                  ? "text-slate-700 hover:bg-slate-50 font-medium cursor-pointer"
-                                  : "text-slate-400 hover:bg-slate-50 cursor-not-allowed opacity-60"
+                              ? "bg-slate-100 text-slate-900 font-semibold"
+                              : canClick
+                                ? "text-slate-700 hover:bg-slate-50 font-medium cursor-pointer"
+                                : "text-slate-400 hover:bg-slate-50 cursor-not-allowed opacity-60"
                               }`}
                           >
                             <span>{mod.name}</span>
@@ -1201,10 +1304,10 @@ export default function ResumeDeskDashboard() {
                             {profile?.account_tier === "developer"
                               ? "Developer"
                               : profile?.account_tier === "tenant_super_admin"
-                              ? "Super Admin"
-                              : profile?.account_tier === "tenant_admin"
-                              ? "Admin (HR Ops)"
-                              : "Team Member"}
+                                ? "Super Admin"
+                                : profile?.account_tier === "tenant_admin"
+                                  ? "Admin (HR Ops)"
+                                  : "Team Member"}
                           </span>
                         </div>
                         {profile?.tenant_name && (
@@ -1372,11 +1475,10 @@ export default function ResumeDeskDashboard() {
                           }
                           setDraggedCandidateId(null);
                         }}
-                        className={`w-[300px] flex flex-col rounded-xl border transition-all duration-150 ${
-                          isDragTarget
+                        className={`w-[300px] flex flex-col rounded-xl border transition-all duration-150 ${isDragTarget
                             ? "bg-blue-50/70 border-blue-400 ring-2 ring-blue-300 ring-dashed shadow-md"
                             : "bg-slate-50/80 border-slate-200"
-                        }`}
+                          }`}
                       >
                         {/* Column Header */}
                         <div className="p-3 border-b border-slate-200/80 flex items-center justify-between bg-white rounded-t-xl">
@@ -1393,11 +1495,10 @@ export default function ResumeDeskDashboard() {
                         <div className="flex-1 overflow-y-auto p-2.5 space-y-2.5">
                           {colCandidates.length === 0 ? (
                             <div
-                              className={`h-28 border-2 border-dashed rounded-lg flex flex-col items-center justify-center text-xs transition-colors ${
-                                isDragTarget
+                              className={`h-28 border-2 border-dashed rounded-lg flex flex-col items-center justify-center text-xs transition-colors ${isDragTarget
                                   ? "border-blue-300 bg-blue-50/40 text-blue-500 font-medium"
                                   : "border-slate-200 text-slate-400"
-                              }`}
+                                }`}
                             >
                               <span>Drop candidate here</span>
                             </div>
@@ -1423,11 +1524,10 @@ export default function ResumeDeskDashboard() {
                                     setDraggedCandidateId(null);
                                     setDragOverCol(null);
                                   }}
-                                  className={`bg-white rounded-lg p-3 border shadow-2xs hover:shadow-md transition-all cursor-grab active:cursor-grabbing select-none group ${
-                                    isBeingDragged
+                                  className={`bg-white rounded-lg p-3 border shadow-2xs hover:shadow-md transition-all cursor-grab active:cursor-grabbing select-none group ${isBeingDragged
                                       ? "opacity-40 border-dashed border-blue-400 scale-[0.98]"
                                       : "border-slate-200 hover:border-slate-300"
-                                  }`}
+                                    }`}
                                 >
                                   {/* Top Row: Name + Drag Handle */}
                                   <div className="flex items-start justify-between gap-1 mb-1.5">
@@ -1543,274 +1643,299 @@ export default function ResumeDeskDashboard() {
                 </div>
               </div>
             </div>
+          ) : !hasResumeDeskAccess ? (
+            /* RESUME DESK RESTRICTED VIEW */
+            <div className="p-8 text-center bg-slate-50 border border-slate-200 rounded-xl max-w-lg mx-auto my-12 shadow-xs">
+              <div className="w-12 h-12 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-center mx-auto mb-3 text-amber-600">
+                <ShieldCheck className="w-6 h-6" />
+              </div>
+              <h3 className="text-sm font-bold text-slate-900">Resume Desk Restricted</h3>
+              <p className="text-xs text-slate-600 mt-2 leading-relaxed">
+                Your account ({user?.email}) does not have permission to access the raw <strong>Resume Desk</strong> intake search.
+              </p>
+              <p className="text-[11px] text-slate-400 mt-1.5">
+                You can access your assigned module from the switcher above.
+              </p>
+              {hasPipelineAccess && (
+                <div className="mt-5">
+                  <button
+                    onClick={() => setActiveTab("Pipeline")}
+                    className="px-4 py-2 bg-slate-900 hover:bg-black text-white text-xs font-semibold rounded-lg shadow-xs transition cursor-pointer inline-flex items-center gap-1.5"
+                  >
+                    <Kanban className="w-3.5 h-3.5" />
+                    <span>Go to Hiring Pipeline</span>
+                  </button>
+                </div>
+              )}
+            </div>
           ) : (
             /* RESUME DESK TABLE VIEW */
             <>
               {/* Status Filter Dropdown Bar */}
               <div className="mb-2 flex items-center justify-between text-xs">
-            <div className="flex items-center gap-2">
-              <div className="relative inline-block text-left">
-                <select
-                  value={statusFilter}
-                  onChange={(e) => {
-                    setStatusFilter(e.target.value);
-                    setPage(1);
-                  }}
-                  className="text-xs font-medium text-slate-700 bg-white border border-transparent hover:border-slate-200 rounded px-2 py-1 cursor-pointer focus:outline-none"
-                >
-                  <option value="All">Status: All ▾</option>
-                  <option value="New">Status: New</option>
-                  <option value="Ready for AI Call">Status: Ready for AI Call</option>
-                  <option value="AI Call Initiated">Status: AI Call Initiated</option>
-                  <option value="Offer Sent">Status: Offer Sent</option>
-                  <option value="Accepted">Status: Accepted</option>
-                  <option value="Rejected">Status: Rejected</option>
-                </select>
+                <div className="flex items-center gap-2">
+                  <div className="relative inline-block text-left">
+                    <select
+                      value={statusFilter}
+                      onChange={(e) => {
+                        setStatusFilter(e.target.value);
+                        setPage(1);
+                      }}
+                      className="text-xs font-medium text-slate-700 bg-white border border-transparent hover:border-slate-200 rounded px-2 py-1 cursor-pointer focus:outline-none"
+                    >
+                      <option value="All">Status: All ▾</option>
+                      <option value="New">Status: New</option>
+
+                      <option value="AI Call Initiated">Status: AI Call Initiated</option>
+                      <option value="Offer Sent">Status: Offer Sent</option>
+                      <option value="Accepted">Status: Accepted</option>
+                      <option value="Rejected">Status: Rejected</option>
+                    </select>
+                  </div>
+
+                  {selectedCount > 0 && (
+                    <span className="text-[11px] bg-rose-50 text-rose-700 font-medium px-2 py-0.5 rounded-full border border-rose-100">
+                      {selectedCount} selected
+                    </span>
+                  )}
+                </div>
+
+                {/* Active sync or background status */}
+                <div className="text-[11px] text-slate-400">
+                  6-hr auto refresh active • Sub-50ms query cache
+                </div>
               </div>
 
-              {selectedCount > 0 && (
-                <span className="text-[11px] bg-rose-50 text-rose-700 font-medium px-2 py-0.5 rounded-full border border-rose-100">
-                  {selectedCount} selected
-                </span>
-              )}
-            </div>
+              {/* Table Container */}
+              <div className="border border-slate-200 rounded overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead className="bg-[#f8fafc] border-b border-slate-200 text-slate-600 font-medium">
+                      <tr>
+                        <th className="p-2.5 w-8 text-center">
+                          <input
+                            type="checkbox"
+                            checked={candidates.length > 0 && selectedCount === candidates.length}
+                            onChange={(e) => handleSelectAll(e.target.checked)}
+                            className="rounded border-slate-300 text-rose-500 focus:ring-rose-400 w-3.5 h-3.5 cursor-pointer"
+                          />
+                        </th>
 
-            {/* Active sync or background status */}
-            <div className="text-[11px] text-slate-400">
-              6-hr auto refresh active • Sub-50ms query cache
-            </div>
-          </div>
-
-          {/* Table Container */}
-          <div className="border border-slate-200 rounded overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs border-collapse">
-                <thead className="bg-[#f8fafc] border-b border-slate-200 text-slate-600 font-medium">
-                  <tr>
-                    <th className="p-2.5 w-8 text-center">
-                      <input
-                        type="checkbox"
-                        checked={candidates.length > 0 && selectedCount === candidates.length}
-                        onChange={(e) => handleSelectAll(e.target.checked)}
-                        className="rounded border-slate-300 text-rose-500 focus:ring-rose-400 w-3.5 h-3.5 cursor-pointer"
-                      />
-                    </th>
-
-                    {/* Name Header (Sortable) */}
-                    <th
-                      onClick={() => handleSort("name")}
-                      className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
-                      title="Click to sort by Name"
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span className={sortBy === "name" ? "text-slate-900 font-semibold" : ""}>Name</span>
-                        <span className="text-[10px]">
-                          {sortBy === "name" ? (
-                            sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
-                          ) : (
-                            <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
-                          )}
-                        </span>
-                      </div>
-                    </th>
-
-                    {/* Phone Header (Sortable) */}
-                    <th
-                      onClick={() => handleSort("phone")}
-                      className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
-                      title="Click to sort by Phone"
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span className={sortBy === "phone" ? "text-slate-900 font-semibold" : ""}>Phone</span>
-                        <span className="text-[10px]">
-                          {sortBy === "phone" ? (
-                            sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
-                          ) : (
-                            <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
-                          )}
-                        </span>
-                      </div>
-                    </th>
-
-                    {/* Location Header (Sortable) */}
-                    <th
-                      onClick={() => handleSort("location")}
-                      className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
-                      title="Click to sort by Location"
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span className={sortBy === "location" ? "text-slate-900 font-semibold" : ""}>Location</span>
-                        <span className="text-[10px]">
-                          {sortBy === "location" ? (
-                            sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
-                          ) : (
-                            <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
-                          )}
-                        </span>
-                      </div>
-                    </th>
-
-                    {/* Email Header (Sortable) */}
-                    <th
-                      onClick={() => handleSort("email")}
-                      className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
-                      title="Click to sort by Email"
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span className={sortBy === "email" ? "text-slate-900 font-semibold" : ""}>Email</span>
-                        <span className="text-[10px]">
-                          {sortBy === "email" ? (
-                            sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
-                          ) : (
-                            <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
-                          )}
-                        </span>
-                      </div>
-                    </th>
-
-                    {/* Status Header (Sortable) */}
-                    <th
-                      onClick={() => handleSort("status")}
-                      className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
-                      title="Click to sort by Status"
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span className={sortBy === "status" ? "text-slate-900 font-semibold" : ""}>Status</span>
-                        <span className="text-[10px]">
-                          {sortBy === "status" ? (
-                            sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
-                          ) : (
-                            <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
-                          )}
-                        </span>
-                      </div>
-                    </th>
-
-                    {/* Comments Header (Sortable) */}
-                    <th
-                      onClick={() => handleSort("comments")}
-                      className="py-2.5 px-3 font-medium text-center cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
-                      title="Click to sort by Comments count"
-                    >
-                      <div className="flex items-center justify-center gap-1.5">
-                        <span className={sortBy === "comments" ? "text-slate-900 font-semibold" : ""}>Comments</span>
-                        <span className="text-[10px]">
-                          {sortBy === "comments" ? (
-                            sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
-                          ) : (
-                            <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
-                          )}
-                        </span>
-                      </div>
-                    </th>
-                  </tr>
-                </thead>
-
-                <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {loading ? (
-                    <tr>
-                      <td colSpan={7} className="py-12 text-center text-slate-400">
-                        <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-rose-400" />
-                        Loading resumes...
-                      </td>
-                    </tr>
-                  ) : candidates.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="py-12 text-center text-slate-400">
-                        No resumes found matching the selected filters.
-                      </td>
-                    </tr>
-                  ) : (
-                    candidates.map((c) => {
-                      const isSelected = !!selectedCandidates[c.id];
-                      const attrs = c.extracted_attributes || {};
-                      const isRenamed = Boolean(
-                        (c.is_renamed || attrs.is_renamed) &&
-                        attrs.previous_path &&
-                        attrs.previous_path.trim().replace(/^\/+/, "") !== (c.drive_folder_path || "").trim().replace(/^\/+/, "")
-                      );
-                      const pathSegments = (c.drive_folder_path || "").replace(/^\/+/, "").split("/");
-                      const roleName = getCandidateJobRole(c) || null;
-                      const displayPath = c.contextual_path || c.drive_folder_path;
-                      const hasDuplicate =
-                        (c.flags || []).includes("duplicate_resume_uploaded") ||
-                        (attrs.duplicate_files && attrs.duplicate_files.length > 0);
-                      const displayStatus = c.display_status || "New";
-
-                      // Status indicator dot color
-                      const statusConfig = STATUS_OPTIONS.find((s) => s.label === displayStatus) || {
-                        color: "bg-slate-400",
-                        text: "text-slate-700",
-                      };
-
-                      return (
-                        <tr
-                          key={c.id}
-                          className={`hover:bg-slate-50/70 transition-colors ${isSelected ? "bg-rose-50/30" : ""
-                            }`}
+                        {/* Name Header (Sortable) */}
+                        <th
+                          onClick={() => handleSort("name")}
+                          className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
+                          title="Click to sort by Name"
                         >
-                          {/* Checkbox */}
-                          <td className="p-2.5 text-center">
-                            <input
-                              type="checkbox"
-                              checked={isSelected}
-                              onChange={(e) => {
-                                setSelectedCandidates((prev) => ({
-                                  ...prev,
-                                  [c.id]: e.target.checked,
-                                }));
-                              }}
-                              className="rounded border-slate-300 text-rose-500 focus:ring-rose-400 w-3.5 h-3.5 cursor-pointer"
-                            />
+                          <div className="flex items-center gap-1.5">
+                            <span className={sortBy === "name" ? "text-slate-900 font-semibold" : ""}>Name</span>
+                            <span className="text-[10px]">
+                              {sortBy === "name" ? (
+                                sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
+                              ) : (
+                                <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
+                              )}
+                            </span>
+                          </div>
+                        </th>
+
+                        {/* Phone Header (Sortable) */}
+                        <th
+                          onClick={() => handleSort("phone")}
+                          className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
+                          title="Click to sort by Phone"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span className={sortBy === "phone" ? "text-slate-900 font-semibold" : ""}>Phone</span>
+                            <span className="text-[10px]">
+                              {sortBy === "phone" ? (
+                                sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
+                              ) : (
+                                <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
+                              )}
+                            </span>
+                          </div>
+                        </th>
+
+                        {/* Location Header (Sortable) */}
+                        <th
+                          onClick={() => handleSort("location")}
+                          className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
+                          title="Click to sort by Location"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span className={sortBy === "location" ? "text-slate-900 font-semibold" : ""}>Location</span>
+                            <span className="text-[10px]">
+                              {sortBy === "location" ? (
+                                sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
+                              ) : (
+                                <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
+                              )}
+                            </span>
+                          </div>
+                        </th>
+
+                        {/* Email Header (Sortable) */}
+                        <th
+                          onClick={() => handleSort("email")}
+                          className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
+                          title="Click to sort by Email"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span className={sortBy === "email" ? "text-slate-900 font-semibold" : ""}>Email</span>
+                            <span className="text-[10px]">
+                              {sortBy === "email" ? (
+                                sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
+                              ) : (
+                                <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
+                              )}
+                            </span>
+                          </div>
+                        </th>
+
+                        {/* Status Header (Sortable) */}
+                        <th
+                          onClick={() => handleSort("status")}
+                          className="py-2.5 px-3 font-medium cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
+                          title="Click to sort by Status"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span className={sortBy === "status" ? "text-slate-900 font-semibold" : ""}>Status</span>
+                            <span className="text-[10px]">
+                              {sortBy === "status" ? (
+                                sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
+                              ) : (
+                                <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
+                              )}
+                            </span>
+                          </div>
+                        </th>
+
+                        {/* Comments Header (Sortable) */}
+                        <th
+                          onClick={() => handleSort("comments")}
+                          className="py-2.5 px-3 font-medium text-center cursor-pointer hover:bg-slate-100/80 transition-colors select-none group"
+                          title="Click to sort by Comments count"
+                        >
+                          <div className="flex items-center justify-center gap-1.5">
+                            <span className={sortBy === "comments" ? "text-slate-900 font-semibold" : ""}>Comments</span>
+                            <span className="text-[10px]">
+                              {sortBy === "comments" ? (
+                                sortOrder === "asc" ? <span className="text-rose-600 font-bold">▲</span> : <span className="text-rose-600 font-bold">▼</span>
+                              ) : (
+                                <span className="text-slate-300 group-hover:text-slate-500">⇅</span>
+                              )}
+                            </span>
+                          </div>
+                        </th>
+                      </tr>
+                    </thead>
+
+                    <tbody className="divide-y divide-slate-100 text-slate-700">
+                      {loading ? (
+                        <tr>
+                          <td colSpan={7} className="py-12 text-center text-slate-400">
+                            <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-rose-400" />
+                            Loading resumes...
                           </td>
+                        </tr>
+                      ) : candidates.length === 0 ? (
+                        <tr>
+                          <td colSpan={7} className="py-12 text-center text-slate-400">
+                            No resumes found matching the selected filters.
+                          </td>
+                        </tr>
+                      ) : (
+                        candidates.map((c) => {
+                          const isSelected = !!selectedCandidates[c.id];
+                          const attrs = c.extracted_attributes || {};
+                          const isRenamed = Boolean(
+                            (c.is_renamed || attrs.is_renamed) &&
+                            attrs.previous_path &&
+                            attrs.previous_path.trim().replace(/^\/+/, "") !== (c.drive_folder_path || "").trim().replace(/^\/+/, "")
+                          );
+                          const pathSegments = (c.drive_folder_path || "").replace(/^\/+/, "").split("/");
+                          const roleName = getCandidateJobRole(c) || null;
+                          const displayPath = c.contextual_path || c.drive_folder_path;
+                          const hasDuplicate =
+                            (c.flags || []).includes("duplicate_resume_uploaded") ||
+                            (attrs.duplicate_files && attrs.duplicate_files.length > 0);
+                          const displayStatus = c.display_status || "New";
 
-                          {/* Candidate Name (Reddish/Coral Link as in Mockup) */}
-                          <td className="py-2 px-3">
-                            <div className="flex flex-col">
-                              <div className="flex items-center gap-1.5 flex-wrap">
-                                <button
-                                  onClick={() => setActiveCandidate(c)}
-                                  className="font-medium text-[#dc2626] hover:underline text-left"
-                                >
-                                  {c.first_name} {c.last_name || ""}
-                                </button>
+                          // Status indicator dot color
+                          const statusConfig = STATUS_OPTIONS.find((s) => s.label === displayStatus) || {
+                            color: "bg-slate-400",
+                            text: "text-slate-700",
+                          };
 
-                                {roleName && (
-                                  <span className="px-1.5 py-0.2 text-[10px] font-medium bg-slate-100 text-slate-700 border border-slate-200 rounded">
-                                    {roleName}
-                                  </span>
-                                )}
+                          return (
+                            <tr
+                              key={c.id}
+                              className={`hover:bg-slate-50/70 transition-colors ${isSelected ? "bg-rose-50/30" : ""
+                                }`}
+                            >
+                              {/* Checkbox */}
+                              <td className="p-2.5 text-center">
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={(e) => {
+                                    setSelectedCandidates((prev) => ({
+                                      ...prev,
+                                      [c.id]: e.target.checked,
+                                    }));
+                                  }}
+                                  className="rounded border-slate-300 text-rose-500 focus:ring-rose-400 w-3.5 h-3.5 cursor-pointer"
+                                />
+                              </td>
 
-                                {/* Multi-location presence badge */}
-                                {c.is_multi_location && (
-                                  <span
-                                    title={`Present in: ${(c.locations_present || [])
-                                      .map((l) => `${l.client_name || ""} ${l.site_name || ""} (${l.role_name || ""})`)
-                                      .join(" • ")}`}
-                                    className="px-1.5 py-0.2 text-[10px] font-medium bg-indigo-50 text-indigo-700 border border-indigo-200 rounded flex items-center gap-1 shadow-2xs"
-                                  >
-                                    <MapPin className="w-2.5 h-2.5 text-indigo-500" />
-                                    <span>
-                                      {selectedSiteId && c.other_locations && c.other_locations.length > 0
-                                        ? `Also in ${c.other_locations.map((l) => l.site_name).join(", ")}`
-                                        : `${c.locations_present?.length} locations: ${(c.locations_present || [])
-                                          .map((l) => l.site_name)
-                                          .join(", ")}`}
-                                    </span>
-                                  </span>
-                                )}
+                              {/* Candidate Name (Reddish/Coral Link as in Mockup) */}
+                              <td className="py-2 px-3">
+                                <div className="flex flex-col">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <button
+                                      onClick={() => setActiveCandidate(c)}
+                                      className="font-medium text-[#dc2626] hover:underline text-left"
+                                    >
+                                      {c.first_name} {c.last_name || ""}
+                                    </button>
 
-                                {/* Duplicate & Rename Flags */}
-                                {isRenamed && (
-                                  <span
-                                    title={`Renamed in Google Drive: ${attrs.previous_path || ""}`}
-                                    className="px-1.5 py-0.2 text-[10px] font-semibold bg-purple-50 text-purple-700 border border-purple-200 rounded"
-                                  >
-                                    Renamed in Drive
-                                  </span>
-                                )}
+                                    {roleName && (
+                                      <span className="px-1.5 py-0.2 text-[10px] font-medium bg-slate-100 text-slate-700 border border-slate-200 rounded">
+                                        {roleName}
+                                      </span>
+                                    )}
 
-                                {/* {hasDuplicate && (
+                                    {/* Multi-location presence badge */}
+                                    {c.is_multi_location && (
+                                      <span
+                                        title={`Present in: ${(c.locations_present || [])
+                                          .map((l) => `${l.client_name || ""} ${l.site_name || ""} (${l.role_name || ""})`)
+                                          .join(" • ")}`}
+                                        className="px-1.5 py-0.2 text-[10px] font-medium bg-indigo-50 text-indigo-700 border border-indigo-200 rounded flex items-center gap-1 shadow-2xs"
+                                      >
+                                        <MapPin className="w-2.5 h-2.5 text-indigo-500" />
+                                        <span>
+                                          {selectedSiteId && c.other_locations && c.other_locations.length > 0
+                                            ? `Also in ${c.other_locations.map((l) => l.site_name).join(", ")}`
+                                            : `${c.locations_present?.length} locations: ${(c.locations_present || [])
+                                              .map((l) => l.site_name)
+                                              .join(", ")}`}
+                                        </span>
+                                      </span>
+                                    )}
+
+                                    {/* Duplicate & Rename Flags */}
+                                    {isRenamed && (
+                                      <span
+                                        title={`Renamed in Google Drive: ${attrs.previous_path || ""}`}
+                                        className="px-1.5 py-0.2 text-[10px] font-semibold bg-purple-50 text-purple-700 border border-purple-200 rounded"
+                                      >
+                                        Renamed in Drive
+                                      </span>
+                                    )}
+
+                                    {/* {hasDuplicate && (
                                   <span
                                     title={`Duplicate resume uploaded in: ${(attrs.duplicate_files || []).join(", ")}`}
                                     className="px-1.5 py-0.2 text-[10px] font-semibold bg-amber-100 text-amber-900 border border-amber-300 rounded flex items-center gap-1 shadow-2xs"
@@ -1819,182 +1944,182 @@ export default function ResumeDeskDashboard() {
                                     <span>Duplicate in Drive</span>
                                   </span>
                                 )} */}
-                              </div>
+                                  </div>
 
-                              {displayPath && (
-                                <div className="flex items-center gap-2 mt-0.5">
-                                  <span className="text-[10px] text-slate-400 truncate max-w-xs">
-                                    {displayPath}
-                                  </span>
-                                  {c.drive_file_id && (
-                                    <a
-                                      href={`https://drive.google.com/file/d/${c.drive_file_id}/view`}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      onClick={(e) => e.stopPropagation()}
-                                      className="inline-flex items-center gap-0.5 text-[10px] text-rose-600 hover:text-rose-800 hover:underline font-medium shrink-0"
-                                      title="Open resume in Google Drive"
-                                    >
-                                      <ExternalLink className="w-2.5 h-2.5" />
-                                      <span>Open</span>
-                                    </a>
+                                  {displayPath && (
+                                    <div className="flex items-center gap-2 mt-0.5">
+                                      <span className="text-[10px] text-slate-400 truncate max-w-xs">
+                                        {displayPath}
+                                      </span>
+                                      {c.drive_file_id && (
+                                        <a
+                                          href={`https://drive.google.com/file/d/${c.drive_file_id}/view`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          onClick={(e) => e.stopPropagation()}
+                                          className="inline-flex items-center gap-0.5 text-[10px] text-rose-600 hover:text-rose-800 hover:underline font-medium shrink-0"
+                                          title="Open resume in Google Drive"
+                                        >
+                                          <ExternalLink className="w-2.5 h-2.5" />
+                                          <span>Open</span>
+                                        </a>
+                                      )}
+                                    </div>
                                   )}
                                 </div>
-                              )}
-                            </div>
-                          </td>
+                              </td>
 
-                          {/* Phone & AI Call Badge */}
-                          <td className="py-2 px-3 whitespace-nowrap">
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono text-slate-800">{c.phone}</span>
-                              <button
-                                type="button"
-                                className="px-2 py-0.5 text-[10px] font-medium bg-white hover:bg-slate-50 text-slate-700 rounded border border-slate-200 flex items-center gap-1"
-                              >
-                                <span>AI Call</span>
-                                {c.ai_call_badge && c.ai_call_badge.includes("/") && (
-                                  <span className="text-amber-600 font-semibold">
-                                    {c.ai_call_badge}
+                              {/* Phone & AI Call Badge */}
+                              <td className="py-2 px-3 whitespace-nowrap">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-slate-800">{c.phone}</span>
+                                  <button
+                                    type="button"
+                                    className="px-2 py-0.5 text-[10px] font-medium bg-white hover:bg-slate-50 text-slate-700 rounded border border-slate-200 flex items-center gap-1"
+                                  >
+                                    <span>AI Call</span>
+                                    {c.ai_call_badge && c.ai_call_badge.includes("/") && (
+                                      <span className="text-amber-600 font-semibold">
+                                        {c.ai_call_badge}
+                                      </span>
+                                    )}
+                                  </button>
+                                </div>
+                              </td>
+
+                              {/* Location */}
+                              <td className="py-2 px-3 whitespace-nowrap text-slate-600">
+                                {c.location || "—"}
+                              </td>
+
+                              {/* Email */}
+                              <td className="py-2 px-3 text-slate-600 truncate max-w-[200px]">
+                                {c.email || "—"}
+                              </td>
+
+                              {/* Status Dropdown with Dot (Interactive) */}
+                              <td className="py-2 px-3 whitespace-nowrap">
+                                <div className="flex items-center gap-1.5">
+                                  <span className={`w-2 h-2 rounded-full ${statusConfig.color}`}></span>
+                                  <select
+                                    value={displayStatus}
+                                    onChange={(e) => handleUpdateStatus(c.id, e.target.value)}
+                                    className="text-xs text-slate-700 bg-transparent border-none hover:bg-slate-100 rounded px-1 py-0.5 cursor-pointer focus:outline-none"
+                                  >
+                                    {STATUS_OPTIONS.map((opt) => (
+                                      <option key={opt.label} value={opt.label}>
+                                        {opt.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              </td>
+
+                              {/* Comments: Microphone outline with note count */}
+                              <td className="py-2 px-3 text-center whitespace-nowrap">
+                                <button
+                                  onClick={() => setNotesModalCandidate(c)}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-rose-200 text-[#dc2626] hover:bg-rose-50 transition-colors text-[11px]"
+                                  title="Click to view or add notes"
+                                >
+                                  <Mic className="w-3.5 h-3.5" />
+                                  <span>
+                                    {c.comments_count || 0}{" "}
+                                    {(c.comments_count || 0) === 1 ? "note" : "notes"}
                                   </span>
-                                )}
-                              </button>
-                            </div>
-                          </td>
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
 
-                          {/* Location */}
-                          <td className="py-2 px-3 whitespace-nowrap text-slate-600">
-                            {c.location || "—"}
-                          </td>
+                {/* Pagination & Rows Per Page Footer */}
+                <div className="p-3 border-t border-slate-200 bg-white flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600 select-none">
+                  {/* Left: Summary + Rows Per Page Selector */}
+                  <div className="flex items-center gap-4">
+                    <span className="font-medium text-slate-700">
+                      {candidatesCount > 0
+                        ? `${(page - 1) * limit + 1}-${Math.min(page * limit, candidatesCount)} of ${candidatesCount} resumes`
+                        : "0 of 0 resumes"}
+                    </span>
 
-                          {/* Email */}
-                          <td className="py-2 px-3 text-slate-600 truncate max-w-[200px]">
-                            {c.email || "—"}
-                          </td>
+                    <div className="flex items-center gap-2 text-slate-500 border-l border-slate-200 pl-4">
+                      <span>Rows per page:</span>
+                      <select
+                        value={limit}
+                        onChange={(e) => {
+                          setLimit(Number(e.target.value));
+                          setPage(1);
+                        }}
+                        className="border border-slate-200 rounded px-2 py-0.5 text-xs text-slate-700 bg-white font-medium focus:outline-none focus:border-slate-400 cursor-pointer"
+                      >
+                        <option value={10}>10</option>
+                        <option value={20}>20</option>
+                        <option value={30}>30</option>
+                        <option value={50}>50</option>
+                        <option value={100}>100</option>
+                      </select>
+                    </div>
+                  </div>
 
-                          {/* Status Dropdown with Dot (Interactive) */}
-                          <td className="py-2 px-3 whitespace-nowrap">
-                            <div className="flex items-center gap-1.5">
-                              <span className={`w-2 h-2 rounded-full ${statusConfig.color}`}></span>
-                              <select
-                                value={displayStatus}
-                                onChange={(e) => handleUpdateStatus(c.id, e.target.value)}
-                                className="text-xs text-slate-700 bg-transparent border-none hover:bg-slate-100 rounded px-1 py-0.5 cursor-pointer focus:outline-none"
-                              >
-                                {STATUS_OPTIONS.map((opt) => (
-                                  <option key={opt.label} value={opt.label}>
-                                    {opt.label}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                          </td>
+                  {/* Right: Page Buttons */}
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setPage((p) => Math.max(1, p - 1))}
+                      disabled={page <= 1}
+                      className="px-2.5 py-1 text-xs border border-slate-200 rounded hover:bg-slate-50 text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed font-medium transition-colors"
+                    >
+                      Previous
+                    </button>
 
-                          {/* Comments: Microphone outline with note count */}
-                          <td className="py-2 px-3 text-center whitespace-nowrap">
-                            <button
-                              onClick={() => setNotesModalCandidate(c)}
-                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-rose-200 text-[#dc2626] hover:bg-rose-50 transition-colors text-[11px]"
-                              title="Click to view or add notes"
-                            >
-                              <Mic className="w-3.5 h-3.5" />
-                              <span>
-                                {c.comments_count || 0}{" "}
-                                {(c.comments_count || 0) === 1 ? "note" : "notes"}
-                              </span>
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
+                    {/* Page Number Buttons */}
+                    {Array.from({ length: totalPages }, (_, i) => i + 1).map((p) => {
+                      const isCurrent = page === p;
+                      if (
+                        totalPages <= 7 ||
+                        p === 1 ||
+                        p === totalPages ||
+                        (p >= page - 1 && p <= page + 1)
+                      ) {
+                        return (
+                          <button
+                            key={p}
+                            type="button"
+                            onClick={() => setPage(p)}
+                            className={`min-w-7 h-7 px-2 flex items-center justify-center rounded text-xs transition-colors ${isCurrent
+                              ? "bg-slate-900 text-white font-semibold shadow-xs"
+                              : "border border-slate-200 text-slate-700 hover:bg-slate-50 font-medium"
+                              }`}
+                          >
+                            {p}
+                          </button>
+                        );
+                      } else if (p === page - 2 || p === page + 2) {
+                        return (
+                          <span key={p} className="px-1 text-slate-400 text-xs">
+                            ...
+                          </span>
+                        );
+                      }
+                      return null;
+                    })}
 
-            {/* Pagination & Rows Per Page Footer */}
-            <div className="p-3 border-t border-slate-200 bg-white flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600 select-none">
-              {/* Left: Summary + Rows Per Page Selector */}
-              <div className="flex items-center gap-4">
-                <span className="font-medium text-slate-700">
-                  {candidatesCount > 0
-                    ? `${(page - 1) * limit + 1}-${Math.min(page * limit, candidatesCount)} of ${candidatesCount} resumes`
-                    : "0 of 0 resumes"}
-                </span>
-
-                <div className="flex items-center gap-2 text-slate-500 border-l border-slate-200 pl-4">
-                  <span>Rows per page:</span>
-                  <select
-                    value={limit}
-                    onChange={(e) => {
-                      setLimit(Number(e.target.value));
-                      setPage(1);
-                    }}
-                    className="border border-slate-200 rounded px-2 py-0.5 text-xs text-slate-700 bg-white font-medium focus:outline-none focus:border-slate-400 cursor-pointer"
-                  >
-                    <option value={10}>10</option>
-                    <option value={20}>20</option>
-                    <option value={30}>30</option>
-                    <option value={50}>50</option>
-                    <option value={100}>100</option>
-                  </select>
+                    <button
+                      type="button"
+                      onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                      disabled={page >= totalPages}
+                      className="px-2.5 py-1 text-xs border border-slate-200 rounded hover:bg-slate-50 text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed font-medium transition-colors"
+                    >
+                      Next
+                    </button>
+                  </div>
                 </div>
               </div>
-
-              {/* Right: Page Buttons */}
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => setPage((p) => Math.max(1, p - 1))}
-                  disabled={page <= 1}
-                  className="px-2.5 py-1 text-xs border border-slate-200 rounded hover:bg-slate-50 text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed font-medium transition-colors"
-                >
-                  Previous
-                </button>
-
-                {/* Page Number Buttons */}
-                {Array.from({ length: totalPages }, (_, i) => i + 1).map((p) => {
-                  const isCurrent = page === p;
-                  if (
-                    totalPages <= 7 ||
-                    p === 1 ||
-                    p === totalPages ||
-                    (p >= page - 1 && p <= page + 1)
-                  ) {
-                    return (
-                      <button
-                        key={p}
-                        type="button"
-                        onClick={() => setPage(p)}
-                        className={`min-w-7 h-7 px-2 flex items-center justify-center rounded text-xs transition-colors ${isCurrent
-                            ? "bg-slate-900 text-white font-semibold shadow-xs"
-                            : "border border-slate-200 text-slate-700 hover:bg-slate-50 font-medium"
-                          }`}
-                      >
-                        {p}
-                      </button>
-                    );
-                  } else if (p === page - 2 || p === page + 2) {
-                    return (
-                      <span key={p} className="px-1 text-slate-400 text-xs">
-                        ...
-                      </span>
-                    );
-                  }
-                  return null;
-                })}
-
-                <button
-                  type="button"
-                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                  disabled={page >= totalPages}
-                  className="px-2.5 py-1 text-xs border border-slate-200 rounded hover:bg-slate-50 text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed font-medium transition-colors"
-                >
-                  Next
-                </button>
-              </div>
-            </div>
-          </div>
             </>
           )}
         </main>
@@ -2346,11 +2471,10 @@ export default function ResumeDeskDashboard() {
                 <button
                   type="button"
                   onClick={toggleVoiceRecording}
-                  className={`p-2 rounded-lg border transition-all flex items-center justify-center cursor-pointer shrink-0 ${
-                    isRecordingNote
+                  className={`p-2 rounded-lg border transition-all flex items-center justify-center cursor-pointer shrink-0 ${isRecordingNote
                       ? "bg-rose-600 text-white border-rose-600 shadow-md animate-pulse"
                       : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 hover:text-slate-900"
-                  }`}
+                    }`}
                   title={isRecordingNote ? "Click to stop recording" : "Click to speak & transcribe note"}
                 >
                   {isRecordingNote ? (
@@ -2377,11 +2501,10 @@ export default function ResumeDeskDashboard() {
                       handleAddNote(notesModalCandidate.id);
                     }
                   }}
-                  className={`flex-1 px-3 py-1.5 text-xs border rounded focus:outline-none transition-colors ${
-                    isRecordingNote
+                  className={`flex-1 px-3 py-1.5 text-xs border rounded focus:outline-none transition-colors ${isRecordingNote
                       ? "border-rose-400 bg-rose-50/20 text-slate-900 focus:border-rose-500"
                       : "border-slate-200 bg-white text-slate-800 focus:border-slate-400"
-                  }`}
+                    }`}
                 />
 
                 {/* Submit button */}

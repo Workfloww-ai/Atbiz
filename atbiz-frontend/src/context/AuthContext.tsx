@@ -38,9 +38,17 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [profile, setProfile] = useState<UserProfile | null>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = localStorage.getItem("atbiz_cached_profile");
+        if (cached) return JSON.parse(cached);
+      } catch {}
+    }
+    return null;
+  });
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
-  const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
 
   const fetchUserProfile = async (token: string, userId: string, userEmail: string): Promise<UserProfile | null> => {
@@ -54,7 +62,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       if (res.ok) {
         const data = await res.json();
-        return data.user as UserProfile;
+        const prof = data.user as UserProfile;
+        if (prof && typeof window !== "undefined") {
+          try {
+            localStorage.setItem("atbiz_cached_profile", JSON.stringify(prof));
+          } catch {}
+        }
+        return prof;
       }
     } catch (e) {
       console.warn("Failed to fetch user profile from API, falling back to database query:", e);
@@ -75,7 +89,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           supabase.from("user_module_assignments").select("module_id").eq("user_id", userId),
         ]);
 
-        return {
+        const fullProf: UserProfile = {
           id: userId,
           email: userEmail,
           full_name: prof.full_name || userEmail.split("@")[0],
@@ -87,6 +101,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           assigned_site_ids: [],
           assigned_modules: (mRes.data || []).map((r: any) => r.module_id),
         };
+        if (typeof window !== "undefined") {
+          try {
+            localStorage.setItem("atbiz_cached_profile", JSON.stringify(fullProf));
+          } catch {}
+        }
+        return fullProf;
       }
     } catch (err) {
       console.error("Error reading profile directly from Supabase:", err);
@@ -117,8 +137,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setSession(session);
       setUser(session?.user ?? null);
       if (session?.user) {
+        // If we already have a cached profile, release loading immediately for instantaneous UX
+        const hasCachedProfile = !!localStorage.getItem("atbiz_cached_profile");
+        if (hasCachedProfile) {
+          setLoading(false);
+        }
         const p = await fetchUserProfile(session.access_token, session.user.id, session.user.email || "");
-        setProfile(p);
+        if (p) setProfile(p);
       }
       setLoading(false);
     });
@@ -131,9 +156,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(session?.user ?? null);
       if (session?.user) {
         const p = await fetchUserProfile(session.access_token, session.user.id, session.user.email || "");
-        setProfile(p);
+        if (p) setProfile(p);
       } else {
         setProfile(null);
+        try {
+          localStorage.removeItem("atbiz_cached_profile");
+        } catch {}
       }
       setLoading(false);
     });
@@ -218,7 +246,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (isAdmin) return true;
     // Normalize module key
     const cleanId = moduleId.toLowerCase().replace(/\s+/g, "_");
-    return profile?.assigned_modules.includes(cleanId) ?? false;
+    const assigned = profile?.assigned_modules || [];
+    if (assigned.includes(cleanId)) return true;
+    // Aliases between frontend names and database module keys
+    if (cleanId === "resume_desk" && assigned.includes("screening")) return true;
+    if (cleanId === "screening" && assigned.includes("resume_desk")) return true;
+    if (cleanId === "pipeline" && assigned.includes("recruitment")) return true;
+    if (cleanId === "recruitment" && assigned.includes("pipeline")) return true;
+    return false;
   };
 
   return (

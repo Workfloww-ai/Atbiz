@@ -1,3 +1,4 @@
+import re
 from typing import Dict, Any, List, Optional
 from app.database import get_supabase
 from app.config import settings
@@ -109,7 +110,7 @@ class IngestionService:
     def ingest_single_file(self, file_data: Dict[str, Any]) -> Dict[str, Any]:
         """Process and save one resume using atomic RPC or safe fallback with rename tracking."""
         import hashlib
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         drive_file_id = file_data["file_id"]
         file_bytes = file_data.get("file_bytes")
@@ -304,7 +305,7 @@ class IngestionService:
                 "last_name": parsed.last_name,
                 "email": parsed.email,
                 "phone": parsed.phone,
-                "dob": parsed.dob if parsed.dob and len(parsed.dob) <= 10 else None,
+                "dob": parsed.dob if (parsed.dob and re.match(r'^\d{4}-\d{2}-\d{2}$', parsed.dob)) else None,
                 "location": parsed.location,
                 "last_qualification": parsed.last_qualification,
                 "experience_years": parsed.experience_years,
@@ -457,37 +458,39 @@ class IngestionService:
         # CHECK 3: Candidate Identity Match (Phone / Email duplicate check)
         # -------------------------------------------------------------
         if parsed.phone and parsed.phone != "+91-0000000000":
-            existing_by_phone = self.supabase.table("candidates")\
-                .select("id, first_name, last_name, drive_folder_path, extracted_attributes")\
-                .eq("tenant_id", self.tenant_id)\
-                .eq("phone", parsed.phone)\
-                .execute()
-            if existing_by_phone.data:
-                existing = existing_by_phone.data[0]
-                attrs = existing.get("extracted_attributes") or {}
-                flags = list(set(attrs.get("flags", []) + ["duplicate_resume_uploaded", "already_present"]))
-                attrs["flags"] = flags
-                dup_files = attrs.get("duplicate_files") or []
-                curr_path = file_data["folder_path"]
-                if curr_path not in dup_files and curr_path != existing.get("drive_folder_path"):
-                    dup_files.append(curr_path)
-                attrs["duplicate_files"] = dup_files
-                
-                # Record location & ensure application exists for this site
-                self._record_candidate_location(existing["id"], file_data, attrs)
+            digits_10 = re.sub(r'\D', '', parsed.phone)[-10:]
+            if len(digits_10) == 10 and not digits_10.startswith("0000"):
+                existing_by_phone = self.supabase.table("candidates")\
+                    .select("id, first_name, last_name, drive_folder_path, extracted_attributes")\
+                    .eq("tenant_id", self.tenant_id)\
+                    .ilike("phone", f"%{digits_10}%")\
+                    .execute()
+                if existing_by_phone.data:
+                    existing = existing_by_phone.data[0]
+                    attrs = existing.get("extracted_attributes") or {}
+                    flags = list(set(attrs.get("flags", []) + ["duplicate_resume_uploaded", "already_present"]))
+                    attrs["flags"] = flags
+                    dup_files = attrs.get("duplicate_files") or []
+                    curr_path = file_data["folder_path"]
+                    if curr_path not in dup_files and curr_path != existing.get("drive_folder_path"):
+                        dup_files.append(curr_path)
+                    attrs["duplicate_files"] = dup_files
+                    
+                    # Record location & ensure application exists for this site
+                    self._record_candidate_location(existing["id"], file_data, attrs)
 
-                return {
-                    "status": "duplicate_identity",
-                    "flag": "person_already_present",
-                    "message": f"Candidate with phone {parsed.phone} is already present as {existing['first_name']} {existing.get('last_name') or ''}. Recorded location and application.",
-                    "candidate_id": existing["id"]
-                }
+                    return {
+                        "status": "duplicate_identity",
+                        "flag": "person_already_present",
+                        "message": f"Candidate with phone {parsed.phone} is already present as {existing['first_name']} {existing.get('last_name') or ''}. Recorded location and application.",
+                        "candidate_id": existing["id"]
+                    }
 
         if parsed.email:
             existing_by_email = self.supabase.table("candidates")\
                 .select("id, first_name, last_name, drive_folder_path, extracted_attributes")\
                 .eq("tenant_id", self.tenant_id)\
-                .eq("email", parsed.email)\
+                .ilike("email", parsed.email.strip())\
                 .execute()
             if existing_by_email.data:
                 existing = existing_by_email.data[0]
@@ -528,7 +531,7 @@ class IngestionService:
             "last_name": parsed.last_name,
             "email": parsed.email,
             "phone": parsed.phone,
-            "dob": parsed.dob if parsed.dob and len(parsed.dob) <= 10 else None,
+            "dob": parsed.dob if (parsed.dob and re.match(r'^\d{4}-\d{2}-\d{2}$', parsed.dob)) else None,
             "location": parsed.location,
             "last_qualification": parsed.last_qualification,
             "experience_years": parsed.experience_years,
@@ -626,9 +629,172 @@ class IngestionService:
             pass
         return reconciled_count
 
+    def prune_deleted_drive_items(self, metadata: Dict[str, Any]) -> Dict[str, int]:
+        """
+        Detects folders and files deleted in Google Drive and removes them from the database:
+        1. Identifies candidate_files whose drive_file_id is no longer in active_file_ids.
+        2. Deletes those files from candidate_files.
+        3. For candidates with multiple locations, removes the deleted location and cleans up
+           applications for deleted sites.
+        4. For candidates with no remaining active files in Drive, deletes the candidate record
+           (cascading to applications and cleaning tasks).
+        5. Persists the active drive_tree hierarchy to tenant settings so /meta/tree reflects
+           only active Drive folders.
+        """
+        from datetime import datetime, timezone
+
+        active_file_ids = set(metadata.get("active_file_ids") or [])
+        active_folder_paths = set(metadata.get("active_folder_paths") or [])
+        hierarchy = metadata.get("hierarchy") or {}
+
+        deleted_files_count = 0
+        deleted_candidates_count = 0
+
+        try:
+            # 1. Fetch all candidate files
+            cf_res = self.supabase.table("candidate_files")\
+                .select("id, candidate_id, drive_file_id, folder_path, client_id, site_id, role_name")\
+                .eq("tenant_id", self.tenant_id)\
+                .execute()
+            candidate_files = cf_res.data or []
+
+            # 2. Fetch all candidates
+            c_res = self.supabase.table("candidates")\
+                .select("id, drive_file_id, drive_folder_path, extracted_attributes")\
+                .eq("tenant_id", self.tenant_id)\
+                .execute()
+            candidates_by_id = {c["id"]: c for c in (c_res.data or [])}
+
+            # 3. Track which files were deleted from Drive
+            deleted_files_by_candidate: Dict[str, List[Dict[str, Any]]] = {}
+
+            for cf in candidate_files:
+                file_id = cf.get("drive_file_id")
+                if not file_id:
+                    continue
+                # If file_id is not among active_file_ids found in Drive
+                if file_id not in active_file_ids:
+                    deleted_files_by_candidate.setdefault(cf["candidate_id"], []).append(cf)
+
+            # Also check candidates table directly for files without candidate_files entry
+            cf_known_file_ids = {cf.get("drive_file_id") for cf in candidate_files if cf.get("drive_file_id")}
+            for cand_id, cand in candidates_by_id.items():
+                c_file_id = cand.get("drive_file_id")
+                if c_file_id and c_file_id not in cf_known_file_ids:
+                    if c_file_id not in active_file_ids:
+                        deleted_files_by_candidate.setdefault(cand_id, []).append({
+                            "id": None,
+                            "candidate_id": cand_id,
+                            "drive_file_id": c_file_id,
+                            "folder_path": cand.get("drive_folder_path"),
+                            "client_id": None,
+                            "site_id": None
+                        })
+
+            # 4. Process deletions
+            for cand_id, del_files in deleted_files_by_candidate.items():
+                deleted_files_count += len(del_files)
+
+                # Delete the rows from candidate_files
+                del_cf_ids = [f["id"] for f in del_files if f.get("id")]
+                if del_cf_ids:
+                    try:
+                        self.supabase.table("candidate_files").delete().in_("id", del_cf_ids).execute()
+                    except Exception as e:
+                        print(f"Error deleting candidate_files: {e}")
+
+                # Check remaining active files for this candidate in memory (avoids N+1 query)
+                rem_files = [
+                    f for f in candidate_files
+                    if f.get("candidate_id") == cand_id and f.get("drive_file_id") in active_file_ids
+                ]
+
+                if not rem_files:
+                    # Candidate has NO remaining active files in Google Drive -> DELETE candidate
+                    try:
+                        self.supabase.table("work_tasks")\
+                            .delete()\
+                            .eq("tenant_id", self.tenant_id)\
+                            .eq("related_entity_type", "candidate")\
+                            .eq("related_entity_id", cand_id)\
+                            .execute()
+                    except Exception:
+                        pass
+
+                    try:
+                        self.supabase.table("candidates")\
+                            .delete()\
+                            .eq("tenant_id", self.tenant_id)\
+                            .eq("id", cand_id)\
+                            .execute()
+                        deleted_candidates_count += 1
+                    except Exception as e:
+                        print(f"Error deleting candidate {cand_id}: {e}")
+                else:
+                    # Candidate still has remaining files at other locations
+                    cand = candidates_by_id.get(cand_id) or {}
+                    attrs = (cand.get("extracted_attributes") or {}).copy()
+                    locs = attrs.get("locations_present") or []
+                    del_file_ids = {f["drive_file_id"] for f in del_files}
+                    del_paths = {f["folder_path"] for f in del_files}
+
+                    new_locs = [
+                        l for l in locs
+                        if l.get("file_id") not in del_file_ids and l.get("path") not in del_paths
+                    ]
+                    attrs["locations_present"] = new_locs
+                    if len(new_locs) <= 1:
+                        attrs["flags"] = [
+                            flag for flag in attrs.get("flags", [])
+                            if flag not in ("multiple_locations", "already_present")
+                        ]
+
+                    # Clean up applications for sites where candidate has no remaining files
+                    for df in del_files:
+                        old_site_id = df.get("site_id")
+                        if old_site_id:
+                            site_still_active = any(rf.get("site_id") == old_site_id for rf in rem_files)
+                            if not site_still_active:
+                                try:
+                                    self.supabase.table("applications")\
+                                        .delete()\
+                                        .eq("tenant_id", self.tenant_id)\
+                                        .eq("candidate_id", cand_id)\
+                                        .eq("site_id", old_site_id)\
+                                        .execute()
+                                except Exception:
+                                    pass
+
+                    # Point primary drive_file_id and drive_folder_path to remaining file
+                    primary_file = rem_files[0]
+                    try:
+                        self.supabase.table("candidates").update({
+                            "drive_file_id": primary_file.get("drive_file_id"),
+                            "drive_folder_path": primary_file.get("folder_path"),
+                            "extracted_attributes": attrs,
+                            "updated_at": datetime.now(timezone.utc).isoformat()
+                        }).eq("id", cand_id).execute()
+                    except Exception as e:
+                        print(f"Error updating candidate on partial folder prune: {e}")
+
+            # 5. Persist active drive_tree hierarchy in tenant settings
+            t_res = self.supabase.table("tenants").select("settings").eq("id", self.tenant_id).execute()
+            t_settings = (t_res.data[0].get("settings") if t_res.data else {}) or {}
+            t_settings["drive_tree"] = hierarchy
+            t_settings["drive_tree_updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.supabase.table("tenants").update({"settings": t_settings}).eq("id", self.tenant_id).execute()
+
+        except Exception as prune_err:
+            print(f"Error in prune_deleted_drive_items: {prune_err}")
+
+        return {
+            "deleted_from_drive": deleted_files_count,
+            "deleted_candidates": deleted_candidates_count
+        }
+
     def run_gdrive_sync(self, root_folder_id: Optional[str] = None) -> Dict[str, Any]:
-        """Crawl Google Drive and ingest all resumes with duplicate tracking."""
-        from datetime import datetime
+        """Crawl Google Drive and ingest all resumes with duplicate and deletion tracking."""
+        from datetime import datetime, timezone
 
         # 1. Run auto-reconciliation on any unmapped files from previous runs
         reconciled = self.reconcile_unresolved_candidates()
@@ -639,6 +805,9 @@ class IngestionService:
             "newly_ingested": 0,
             "skipped_duplicates": 0,
             "renamed_in_drive": 0,
+            "unchanged_files": 0,
+            "deleted_from_drive": 0,
+            "deleted_candidates": 0,
             "reconciled_files": reconciled,
             "synced_at": datetime.utcnow().isoformat() + "Z",
             "errors": []
@@ -663,7 +832,11 @@ class IngestionService:
                     "error": str(e)
                 })
 
-        return stats
+        # 2. Prune files/candidates deleted from Google Drive
+        if getattr(gdrive, "last_crawl_metadata", {}).get("completed"):
+            prune_stats = self.prune_deleted_drive_items(gdrive.last_crawl_metadata)
+            stats["deleted_from_drive"] = prune_stats.get("deleted_from_drive", 0)
+            stats["deleted_candidates"] = prune_stats.get("deleted_candidates", 0)
 
         return stats
 
@@ -673,6 +846,8 @@ class IngestionService:
             "total_scanned": 0,
             "newly_ingested": 0,
             "skipped_duplicates": 0,
+            "deleted_from_drive": 0,
+            "deleted_candidates": 0,
             "errors": []
         }
 
@@ -690,6 +865,12 @@ class IngestionService:
                     "path": file_item["folder_path"],
                     "error": str(e)
                 })
+
+        # Prune deleted items from local sync test
+        if getattr(GoogleDriveService, "last_crawl_metadata", {}).get("completed"):
+            prune_stats = self.prune_deleted_drive_items(GoogleDriveService.last_crawl_metadata)
+            stats["deleted_from_drive"] = prune_stats.get("deleted_from_drive", 0)
+            stats["deleted_candidates"] = prune_stats.get("deleted_candidates", 0)
 
         return stats
 

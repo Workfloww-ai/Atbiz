@@ -75,27 +75,85 @@ def get_clients_and_sites_tree(tenant_id: Optional[str] = None):
             site_roles.setdefault(s_id, {})
             site_roles[s_id][role] = site_roles[s_id].get(role, 0) + 1
 
+    # 4. Fetch active drive_tree from tenant settings
+    drive_tree = None
+    try:
+        t_res = supabase.table("tenants").select("settings").eq("id", t_id).execute()
+        if t_res.data:
+            drive_tree = (t_res.data[0].get("settings") or {}).get("drive_tree")
+    except Exception:
+        pass
+
+    def _normalize(s: str) -> str:
+        import re
+        return re.sub(r'[^a-zA-Z0-9]', '', s or '').lower()
+
     tree = []
     for c in clients:
-        c_sites = [s for s in sites if s["client_id"] == c["id"]]
+        c_id = c["id"]
+        c_count = client_counts.get(c_id, 0)
+        c_sites = [s for s in sites if s["client_id"] == c_id]
+
+        matched_drive_client_sites = None
+        if drive_tree:
+            c_name_norm = _normalize(c.get("name"))
+            c_code_norm = _normalize(c.get("code"))
+            for drive_c_name, drive_c_sites in drive_tree.items():
+                dc_norm = _normalize(drive_c_name)
+                if dc_norm in c_name_norm or c_name_norm in dc_norm or dc_norm == c_code_norm:
+                    matched_drive_client_sites = drive_c_sites
+                    break
+
+        # If drive_tree is active and this client folder was deleted/not in Drive, and has 0 candidates, omit it
+        if drive_tree is not None and matched_drive_client_sites is None and c_count == 0:
+            continue
+
+        site_items = []
+        for s in c_sites:
+            s_id = s["id"]
+            s_count = site_counts.get(s_id, 0)
+
+            matched_drive_roles = None
+            if matched_drive_client_sites is not None:
+                s_state_norm = _normalize(s.get("state"))
+                s_name_norm = _normalize(s.get("site_name"))
+                s_code_norm = _normalize(s.get("site_code"))
+                for drive_s_name, drive_roles in matched_drive_client_sites.items():
+                    ds_norm = _normalize(drive_s_name)
+                    if ds_norm == s_state_norm or ds_norm in s_name_norm or s_state_norm in ds_norm or ds_norm == s_code_norm:
+                        matched_drive_roles = drive_roles
+                        break
+
+            # If drive_tree is active and this site folder was deleted/not in Drive, and has 0 candidates, omit it
+            if matched_drive_client_sites is not None and matched_drive_roles is None and s_count == 0:
+                continue
+
+            # Roles under site: active in Drive or having active candidates
+            roles_set = set()
+            if matched_drive_roles is not None:
+                roles_set.update(matched_drive_roles)
+            roles_set.update(site_roles.get(s_id, {}).keys())
+
+            role_items = [
+                {"name": role_name, "count": site_roles.get(s_id, {}).get(role_name, 0)}
+                for role_name in roles_set
+            ]
+            role_items.sort(key=lambda x: (-x["count"], x["name"]))
+
+            site_items.append({
+                "id": s["id"],
+                "state": s["state"],
+                "name": s["site_name"] or s["state"],
+                "count": s_count,
+                "roles": role_items
+            })
+
         tree.append({
             "id": c["id"],
             "code": c["code"],
             "name": c["name"],
-            "count": client_counts.get(c["id"], 0),
-            "sites": [
-                {
-                    "id": s["id"],
-                    "state": s["state"],
-                    "name": s["site_name"] or s["state"],
-                    "count": site_counts.get(s["id"], 0),
-                    "roles": [
-                        {"name": role_name, "count": r_count}
-                        for role_name, r_count in sorted(site_roles.get(s["id"], {}).items(), key=lambda x: -x[1])
-                    ]
-                }
-                for s in c_sites
-            ]
+            "count": c_count,
+            "sites": site_items
         })
 
     return {

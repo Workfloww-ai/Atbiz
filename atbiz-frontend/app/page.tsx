@@ -23,7 +23,11 @@ export default function WelcomePage() {
     canAccessModule,
   } = useAuth();
 
-  const hasResumeDesk = isAdmin || canAccessModule("resume_desk");
+  const hasAccess =
+    isAdmin ||
+    canAccessModule("resume_desk") ||
+    canAccessModule("pipeline") ||
+    ((profile?.assigned_modules?.length ?? 0) > 0);
 
   return (
     <div className="min-h-screen bg-[#f8fafc] text-slate-800 flex flex-col justify-between font-sans selection:bg-slate-900 selection:text-white">
@@ -55,7 +59,7 @@ export default function WelcomePage() {
                   {profile?.full_name || user.email?.split("@")[0]}
                 </span>
                 <Link
-                  href={hasResumeDesk ? "/resume-desk" : "/login"}
+                  href={hasAccess ? "/resume-desk" : "/login"}
                   className="px-3.5 py-1.5 text-xs font-semibold bg-slate-900 hover:bg-black text-white rounded transition shadow-xs flex items-center gap-1.5"
                 >
                   <span>Enter Portal</span>
@@ -111,7 +115,7 @@ export default function WelcomePage() {
               <div className="text-xs text-slate-400">Verifying session...</div>
             ) : user ? (
               <Link
-                href={hasResumeDesk ? "/resume-desk" : "/login"}
+                href={hasAccess ? "/resume-desk" : "/login"}
                 className="px-6 py-3 bg-slate-900 hover:bg-black text-white font-semibold text-xs rounded-lg transition shadow-md flex items-center justify-center gap-2"
               >
                 <span>Enter Workspace</span>
